@@ -7,7 +7,7 @@
 use crate::backend::CompiledProgram;
 use crate::error::RuntimeError;
 use crate::instruction::{Instruction, ValueType};
-use crate::value::Value;
+use crate::value::{RuntimeType, Value};
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::Ieee64;
 use cranelift_codegen::ir::{
@@ -34,8 +34,8 @@ use std::time::Instant;
 const MAX_FUNCTION_INSTRUCTIONS: usize = 512;
 const MAX_LOCALS: usize = 256;
 const MAX_STACK: usize = 256;
-const MAX_JIT_FUNCTIONS: usize = 128;
-const MAX_JIT_CODE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_JIT_FUNCTIONS: usize = 512;
+const MAX_JIT_CODE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_JIT_ENUM_VARIANTS: usize = 32;
 const MAX_JIT_ROOTS: usize = 65_536;
 const MAX_JIT_CALL_ARGS: usize = 16;
@@ -2759,6 +2759,432 @@ fn jit_reachable_pcs(
     reachable
 }
 
+fn jit_instruction_is_linear(instruction: &Instruction, known_load_tag: Option<u64>) -> bool {
+    match instruction {
+        Instruction::Push(value) => constant_slot(value).is_some(),
+        Instruction::Load(_) => known_load_tag.is_some(),
+        Instruction::Store(_)
+        | Instruction::Dup
+        | Instruction::Pop
+        | Instruction::StackTruncate(_)
+        | Instruction::Swap => true,
+        Instruction::IsType(value_type) => type_tag(value_type).is_some(),
+        _ => false,
+    }
+}
+
+fn jit_bytecode_block_starts(
+    plan: &FunctionPlan,
+    artifact: &CompiledProgram,
+    reachable: &[bool],
+    type_states: &[Option<JitTypeState>],
+) -> std::collections::BTreeSet<usize> {
+    let mut starts = std::collections::BTreeSet::from([plan.entry]);
+    starts.extend(plan.osr_entries.iter().copied());
+    for pc in plan.entry..plan.end {
+        let relative = pc - plan.entry;
+        if !reachable.get(relative).copied().unwrap_or(false) {
+            continue;
+        }
+        let Some(instruction) = artifact.instructions.get(pc) else {
+            continue;
+        };
+        let known_load_tag = match instruction {
+            Instruction::Load(index) => type_states
+                .get(relative)
+                .and_then(Option::as_ref)
+                .and_then(|state| state.locals.get(*index))
+                .copied()
+                .flatten(),
+            _ => None,
+        };
+        match instruction {
+            Instruction::Jump(target) => {
+                starts.insert(*target);
+            }
+            Instruction::JumpIfFalse(target)
+            | Instruction::JumpIfTrue(target)
+            | Instruction::JumpIfNoPropagation(target) => {
+                starts.insert(*target);
+                if pc + 1 < plan.end {
+                    starts.insert(pc + 1);
+                }
+            }
+            _ => {}
+        }
+        if !jit_instruction_is_linear(instruction, known_load_tag)
+            && pc + 1 < plan.end
+            && reachable.get(relative + 1).copied().unwrap_or(false)
+        {
+            starts.insert(pc + 1);
+        }
+    }
+    starts
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JitTypeState {
+    locals: Vec<Option<u64>>,
+    stack: Vec<Option<u64>>,
+}
+
+impl JitTypeState {
+    fn has_facts(&self) -> bool {
+        self.locals.iter().any(Option::is_some) || self.stack.iter().any(Option::is_some)
+    }
+}
+
+fn exact_stack_tag_pair(state: &JitTypeState, left: usize, right: usize) -> Option<(u64, u64)> {
+    Some(((*state.stack.get(left)?)?, (*state.stack.get(right)?)?))
+}
+
+fn runtime_type_jit_tag(runtime_type: &RuntimeType) -> Option<u64> {
+    Some(match runtime_type {
+        RuntimeType::Int => TAG_INT,
+        RuntimeType::UInt => TAG_UINT,
+        RuntimeType::Float => TAG_FLOAT,
+        RuntimeType::Bool => TAG_BOOL,
+        RuntimeType::Char => TAG_CHAR,
+        RuntimeType::Nil => TAG_NIL,
+        _ => return None,
+    })
+}
+
+fn jit_entry_type_state(plan: &FunctionPlan, artifact: &CompiledProgram) -> Option<JitTypeState> {
+    let entry_depth = plan.stack_depths.first().copied().flatten()?;
+    let mut stack = vec![None; entry_depth];
+    if let Some(parameter_types) = artifact
+        .callables
+        .get(&plan.entry)
+        .and_then(|signature| signature.parameter_types.as_ref())
+    {
+        for (slot, parameter_type) in stack.iter_mut().zip(parameter_types) {
+            *slot = parameter_type.as_ref().and_then(runtime_type_jit_tag);
+        }
+    }
+    Some(JitTypeState {
+        locals: vec![None; plan.local_count],
+        stack,
+    })
+}
+
+fn jit_instruction_preserves_type_facts(instruction: &Instruction, state: &JitTypeState) -> bool {
+    if matches!(instruction, Instruction::Add) {
+        return exact_stack_tag_pair(
+            state,
+            state.stack.len().saturating_sub(2),
+            state.stack.len().saturating_sub(1),
+        )
+        .is_some_and(|(left, right)| {
+            matches!(left, TAG_INT | TAG_UINT | TAG_FLOAT)
+                && matches!(right, TAG_INT | TAG_UINT | TAG_FLOAT)
+        });
+    }
+    if matches!(instruction, Instruction::ConstrainArrayFrom) {
+        return state
+            .stack
+            .get(state.stack.len().saturating_sub(2))
+            .copied()
+            .flatten()
+            .is_some_and(|tag| tag != TAG_ARRAY);
+    }
+    matches!(
+        instruction,
+        Instruction::Push(_)
+            | Instruction::Load(_)
+            | Instruction::Store(_)
+            | Instruction::Add
+            | Instruction::Sub
+            | Instruction::Mul
+            | Instruction::Div
+            | Instruction::Mod
+            | Instruction::Eq
+            | Instruction::Ne
+            | Instruction::Lt
+            | Instruction::Le
+            | Instruction::Gt
+            | Instruction::Ge
+            | Instruction::And
+            | Instruction::Or
+            | Instruction::Xor
+            | Instruction::Not
+            | Instruction::Jump(_)
+            | Instruction::JumpIfFalse(_)
+            | Instruction::JumpIfTrue(_)
+            | Instruction::JumpIfNoPropagation(_)
+            | Instruction::IsType(_)
+            | Instruction::Dup
+            | Instruction::Pop
+            | Instruction::Swap
+            | Instruction::StackTruncate(_)
+            | Instruction::ConstrainArrayFrom
+    )
+}
+
+fn known_numeric_result_tag(
+    left: Option<u64>,
+    right: Option<u64>,
+    instruction: &Instruction,
+) -> Option<u64> {
+    let left = left?;
+    let right = right?;
+    if left != right {
+        return None;
+    }
+    match (instruction, left) {
+        (
+            Instruction::Add
+            | Instruction::Sub
+            | Instruction::Mul
+            | Instruction::Div
+            | Instruction::Mod,
+            TAG_INT | TAG_UINT,
+        )
+        | (Instruction::Add | Instruction::Sub | Instruction::Mul | Instruction::Div, TAG_FLOAT) => {
+            Some(left)
+        }
+        _ => None,
+    }
+}
+
+fn known_comparison_result_tag(
+    left: Option<u64>,
+    right: Option<u64>,
+    instruction: &Instruction,
+) -> Option<u64> {
+    let left = left?;
+    if right? != left {
+        return None;
+    }
+    match left {
+        TAG_INT | TAG_UINT | TAG_FLOAT | TAG_CHAR => Some(TAG_BOOL),
+        TAG_BOOL | TAG_NIL if matches!(instruction, Instruction::Eq | Instruction::Ne) => {
+            Some(TAG_BOOL)
+        }
+        _ => None,
+    }
+}
+
+fn jit_type_state_after(
+    state: &JitTypeState,
+    instruction: &Instruction,
+    imports: &[crate::runtime::NativeImport],
+) -> Option<JitTypeState> {
+    if let Instruction::StackTruncate(target) = instruction {
+        if *target > state.stack.len() {
+            return None;
+        }
+        let mut next = state.clone();
+        next.stack.truncate(*target);
+        return Some(next);
+    }
+    let (required, produced) = instruction.stack_effect(imports).ok()?;
+    if state.stack.len() < required {
+        return None;
+    }
+
+    let mut next = state.clone();
+    let retained = state.stack.len() - required;
+    let popped = &state.stack[retained..];
+    next.stack.truncate(retained);
+    match instruction {
+        Instruction::Push(value) => {
+            next.stack.push(constant_slot(value).map(|slot| slot.tag));
+        }
+        Instruction::Load(index) => {
+            next.stack.push(*state.locals.get(*index)?);
+        }
+        Instruction::Store(index) => {
+            *next.locals.get_mut(*index)? = popped.last().copied().flatten();
+        }
+        Instruction::Dup => {
+            let value = *popped.last()?;
+            next.stack.extend([value, value]);
+        }
+        Instruction::Swap => {
+            if popped.len() != 2 {
+                return None;
+            }
+            next.stack.extend([popped[1], popped[0]]);
+        }
+        Instruction::Add
+        | Instruction::Sub
+        | Instruction::Mul
+        | Instruction::Div
+        | Instruction::Mod => {
+            let left = popped.get(popped.len().checked_sub(2)?).copied().flatten();
+            let right = popped.last().copied().flatten();
+            next.stack
+                .push(known_numeric_result_tag(left, right, instruction));
+        }
+        Instruction::Eq
+        | Instruction::Ne
+        | Instruction::Lt
+        | Instruction::Le
+        | Instruction::Gt
+        | Instruction::Ge => {
+            let left = popped.get(popped.len().checked_sub(2)?).copied().flatten();
+            let right = popped.last().copied().flatten();
+            next.stack
+                .push(known_comparison_result_tag(left, right, instruction));
+        }
+        Instruction::IsType(value_type) if type_tag(value_type).is_some() => {
+            next.stack.push(Some(TAG_BOOL));
+        }
+        Instruction::Not if popped.last() == Some(&Some(TAG_BOOL)) => {
+            next.stack.push(Some(TAG_BOOL));
+        }
+        Instruction::And | Instruction::Or | Instruction::Xor
+            if popped == [Some(TAG_BOOL), Some(TAG_BOOL)] =>
+        {
+            next.stack.push(Some(TAG_BOOL));
+        }
+        Instruction::ConstrainArrayFrom => {
+            next.stack.push(popped.first().copied().flatten());
+        }
+        _ => next.stack.resize(retained + produced, None),
+    }
+
+    if !jit_instruction_preserves_type_facts(instruction, state) {
+        next.locals.fill(None);
+        next.stack.fill(None);
+    }
+    Some(next)
+}
+
+fn merge_jit_type_states(current: &mut JitTypeState, incoming: &JitTypeState) -> Option<bool> {
+    if current.locals.len() != incoming.locals.len() || current.stack.len() != incoming.stack.len()
+    {
+        return None;
+    }
+    let mut changed = false;
+    for (current, incoming) in current.locals.iter_mut().zip(&incoming.locals) {
+        if current.is_some() && current != incoming {
+            *current = None;
+            changed = true;
+        }
+    }
+    for (current, incoming) in current.stack.iter_mut().zip(&incoming.stack) {
+        if current.is_some() && current != incoming {
+            *current = None;
+            changed = true;
+        }
+    }
+    Some(changed)
+}
+
+fn infer_jit_type_states(
+    plan: &FunctionPlan,
+    artifact: &CompiledProgram,
+) -> Vec<Option<JitTypeState>> {
+    let mut states = vec![None; plan.end - plan.entry];
+    let Some(entry_state) = jit_entry_type_state(plan, artifact) else {
+        return states;
+    };
+    states[0] = Some(entry_state);
+    let mut queue = VecDeque::from([plan.entry]);
+    while let Some(pc) = queue.pop_front() {
+        let relative = pc - plan.entry;
+        let Some(state) = states.get(relative).and_then(Clone::clone) else {
+            continue;
+        };
+        let Some(instruction) = artifact.instructions.get(pc) else {
+            continue;
+        };
+        let Some(next_state) = jit_type_state_after(&state, instruction, &artifact.imports) else {
+            continue;
+        };
+        let successors = match instruction {
+            Instruction::Jump(target) => [Some(*target), None],
+            Instruction::JumpIfFalse(target)
+            | Instruction::JumpIfTrue(target)
+            | Instruction::JumpIfNoPropagation(target) => [Some(*target), Some(pc + 1)],
+            Instruction::Return
+            | Instruction::ReturnPropagate
+            | Instruction::Crash(_)
+            | Instruction::Halt => [None, None],
+            _ if pc + 1 < plan.end => [Some(pc + 1), None],
+            _ => [None, None],
+        };
+        for successor in successors.into_iter().flatten() {
+            let Some(successor_relative) = successor.checked_sub(plan.entry) else {
+                continue;
+            };
+            let Some(expected_depth) = plan.stack_depths.get(successor_relative).copied().flatten()
+            else {
+                continue;
+            };
+            if next_state.stack.len() != expected_depth {
+                continue;
+            }
+            let Some(target_state) = states.get_mut(successor_relative) else {
+                continue;
+            };
+            let changed = match target_state {
+                Some(current) => merge_jit_type_states(current, &next_state).unwrap_or(false),
+                None => {
+                    *target_state = Some(next_state.clone());
+                    true
+                }
+            };
+            if changed {
+                queue.push_back(successor);
+            }
+        }
+    }
+    states
+}
+
+fn emit_jit_type_guard(
+    builder: &mut FunctionBuilder<'_>,
+    frame: cranelift_codegen::ir::Value,
+    local_state: &JitLocalState,
+    pc: usize,
+    depth: usize,
+    state: &JitTypeState,
+    target: cranelift_codegen::ir::Block,
+) {
+    let mut checks = Vec::new();
+    for (index, expected) in state.locals.iter().copied().enumerate() {
+        let Some(expected) = expected else {
+            continue;
+        };
+        let (tag_variable, _) = local_state.variables[index];
+        let tag = builder.use_var(tag_variable);
+        checks.push(builder.ins().icmp_imm_s(IntCC::Equal, tag, expected as i64));
+    }
+    for (index, expected) in state.stack.iter().copied().enumerate() {
+        let Some(expected) = expected else {
+            continue;
+        };
+        let tag = load_stack_field(builder, local_state, index, 0);
+        checks.push(builder.ins().icmp_imm_s(IntCC::Equal, tag, expected as i64));
+    }
+    if checks.is_empty() {
+        builder.ins().jump(target, &[]);
+        return;
+    }
+    let mut all_valid = checks[0];
+    for check in checks.into_iter().skip(1) {
+        all_valid = builder.ins().band(all_valid, check);
+    }
+    let valid = builder.create_block();
+    let invalid = builder.create_block();
+    builder.ins().brif(all_valid, valid, &[], invalid, &[]);
+    builder.switch_to_block(invalid);
+    emit_exit(
+        builder,
+        frame,
+        local_state,
+        pc,
+        depth,
+        EXIT_RESUME,
+        REASON_NORMAL,
+    );
+    builder.switch_to_block(valid);
+    builder.ins().jump(target, &[]);
+}
+
 struct JitLocalState {
     variables: Vec<(Variable, Variable)>,
     stack_variables: Vec<(Variable, Variable)>,
@@ -2817,10 +3243,45 @@ fn lower_function(
         exit_block,
     };
     let reachable = jit_reachable_pcs(plan, artifact, variant_tags);
+    let type_states = infer_jit_type_states(plan, artifact);
+    let block_starts = jit_bytecode_block_starts(plan, artifact, &reachable, &type_states);
     let mut blocks = HashMap::new();
-    for (relative, depth) in plan.stack_depths.iter().enumerate() {
-        if depth.is_some() && reachable[relative] {
-            blocks.insert(plan.entry + relative, builder.create_block());
+    for start in block_starts.iter().copied() {
+        let relative = start - plan.entry;
+        if reachable.get(relative).copied().unwrap_or(false) {
+            blocks.insert(start, builder.create_block());
+        }
+    }
+    let mut block_for_pc = HashMap::new();
+    let mut active_block = None;
+    for (relative, is_reachable) in reachable.iter().copied().enumerate() {
+        if !is_reachable {
+            continue;
+        }
+        let pc = plan.entry + relative;
+        if let Some(block) = blocks.get(&pc).copied() {
+            active_block = Some(block);
+        }
+        if let Some(block) = active_block {
+            block_for_pc.insert(pc, block);
+        }
+    }
+    if std::env::var_os("COG_JIT_DUMP_IR").is_some() {
+        eprintln!(
+            "[jit] bytecode blocks function={} starts={block_starts:?} osr={:?}",
+            plan.entry, plan.osr_entries
+        );
+        for (relative, state) in type_states.iter().enumerate() {
+            if let Some(state) = state.as_ref() {
+                eprintln!(
+                    "[jit] inferred-types function={} pc={} instruction={:?} locals={:?} stack={:?}",
+                    plan.entry,
+                    plan.entry + relative,
+                    artifact.instructions.get(plan.entry + relative),
+                    state.locals,
+                    state.stack
+                );
+            }
         }
     }
 
@@ -2861,15 +3322,34 @@ fn lower_function(
     let entry_pc = builder
         .ins()
         .icmp_imm_s(IntCC::Equal, start_pc, plan.entry as i64);
-    let entry_block = blocks
+    let entry_block = block_for_pc
         .get(&plan.entry)
         .copied()
         .ok_or("function entry has no bytecode block")?;
     let next = builder.create_block();
-    builder.ins().brif(entry_pc, entry_block, &[], next, &[]);
+    if let Some(entry_guard) = type_states
+        .first()
+        .and_then(Option::as_ref)
+        .filter(|state| state.has_facts())
+    {
+        let guard = builder.create_block();
+        builder.ins().brif(entry_pc, guard, &[], next, &[]);
+        builder.switch_to_block(guard);
+        emit_jit_type_guard(
+            &mut builder,
+            frame,
+            &local_state,
+            plan.entry,
+            entry_depth,
+            entry_guard,
+            entry_block,
+        );
+    } else {
+        builder.ins().brif(entry_pc, entry_block, &[], next, &[]);
+    }
     builder.switch_to_block(next);
     for target in &plan.osr_entries {
-        let target_block = blocks
+        let target_block = block_for_pc
             .get(target)
             .copied()
             .ok_or("OSR point has no bytecode block")?;
@@ -2877,7 +3357,28 @@ fn lower_function(
             .ins()
             .icmp_imm_s(IntCC::Equal, start_pc, *target as i64);
         let next = builder.create_block();
-        builder.ins().brif(is_target, target_block, &[], next, &[]);
+        let target_guard = type_states
+            .get(target - plan.entry)
+            .and_then(Option::as_ref)
+            .filter(|state| state.has_facts());
+        if let Some(target_guard) = target_guard {
+            let guard = builder.create_block();
+            builder.ins().brif(is_target, guard, &[], next, &[]);
+            builder.switch_to_block(guard);
+            let depth = plan.stack_depths[target - plan.entry]
+                .ok_or("OSR point has no verified stack depth")?;
+            emit_jit_type_guard(
+                &mut builder,
+                frame,
+                &local_state,
+                *target,
+                depth,
+                target_guard,
+                target_block,
+            );
+        } else {
+            builder.ins().brif(is_target, target_block, &[], next, &[]);
+        }
         builder.switch_to_block(next);
     }
     let fallback = builder.ins().iconst(types::I32, i64::from(EXIT_RESUME));
@@ -2888,13 +3389,20 @@ fn lower_function(
         let Some(depth) = plan.stack_depths[relative].filter(|_| reachable[relative]) else {
             continue;
         };
-        builder.switch_to_block(blocks[&pc]);
-        let next = blocks.get(&(pc + 1)).copied();
+        let type_state = type_states.get(relative).and_then(Option::as_ref);
+        let bytecode_block = block_for_pc
+            .get(&pc)
+            .copied()
+            .ok_or("reachable bytecode has no Cranelift block")?;
+        if block_starts.contains(&pc) {
+            builder.switch_to_block(bytecode_block);
+        }
+        let next = block_for_pc.get(&(pc + 1)).copied();
         match &artifact.instructions[pc] {
             Instruction::Push(value) => {
                 if let Some(slot) = constant_slot(value) {
                     store_stack_const(&mut builder, &local_state, depth, slot);
-                    jump_to(&mut builder, next, "push fallthrough")?;
+                    continue_linear_block(&mut builder, bytecode_block, next, "push fallthrough")?;
                 } else {
                     emit_exit(
                         &mut builder,
@@ -2909,29 +3417,49 @@ fn lower_function(
             }
             Instruction::Load(index) => {
                 let (tag_variable, payload_variable) = local_state.variables[*index];
-                let tag = builder.use_var(tag_variable);
-                let initialized =
-                    builder
-                        .ins()
-                        .icmp_imm_s(IntCC::NotEqual, tag, TAG_UNINITIALIZED as i64);
-                let valid = builder.create_block();
-                let invalid = builder.create_block();
-                builder.ins().brif(initialized, valid, &[], invalid, &[]);
-                builder.switch_to_block(invalid);
-                emit_exit(
-                    &mut builder,
-                    frame,
-                    &local_state,
-                    pc,
-                    depth,
-                    EXIT_FAULT,
-                    REASON_NORMAL,
-                );
-                builder.switch_to_block(valid);
                 let payload = builder.use_var(payload_variable);
-                store_stack_field(&mut builder, &local_state, depth, 0, tag);
-                store_stack_field(&mut builder, &local_state, depth, 8, payload);
-                jump_to(&mut builder, next, "load fallthrough")?;
+                if type_state
+                    .and_then(|state| state.locals.get(*index))
+                    .copied()
+                    .flatten()
+                    .is_some()
+                {
+                    // Entry and OSR guards establish the type. Keep the tag
+                    // value live, though: mixed numeric comparisons need it
+                    // to select the correct ordering path.
+                    let tag = builder.use_var(tag_variable);
+                    builder.def_var(local_state.stack_variables[depth].0, tag);
+                    store_stack_field(&mut builder, &local_state, depth, 8, payload);
+                    continue_linear_block(
+                        &mut builder,
+                        bytecode_block,
+                        next,
+                        "typed load fallthrough",
+                    )?;
+                } else {
+                    let tag = builder.use_var(tag_variable);
+                    let initialized =
+                        builder
+                            .ins()
+                            .icmp_imm_s(IntCC::NotEqual, tag, TAG_UNINITIALIZED as i64);
+                    let valid = builder.create_block();
+                    let invalid = builder.create_block();
+                    builder.ins().brif(initialized, valid, &[], invalid, &[]);
+                    builder.switch_to_block(invalid);
+                    emit_exit(
+                        &mut builder,
+                        frame,
+                        &local_state,
+                        pc,
+                        depth,
+                        EXIT_FAULT,
+                        REASON_NORMAL,
+                    );
+                    builder.switch_to_block(valid);
+                    store_stack_field(&mut builder, &local_state, depth, 0, tag);
+                    store_stack_field(&mut builder, &local_state, depth, 8, payload);
+                    jump_to(&mut builder, next, "load fallthrough")?;
+                }
             }
             Instruction::LoadCapture(index) => {
                 let capture_count = load_frame(
@@ -2983,19 +3511,35 @@ fn lower_function(
             }
             Instruction::Store(index) => {
                 let (tag_variable, payload_variable) = local_state.variables[*index];
-                let tag = load_stack_field(&mut builder, &local_state, depth - 1, 0);
+                let known_tag = type_state
+                    .and_then(|state| state.stack.get(depth - 1))
+                    .copied()
+                    .flatten();
+                let tag = match known_tag {
+                    Some(tag) => iconst_i64(&mut builder, tag as i64),
+                    None => load_stack_field(&mut builder, &local_state, depth - 1, 0),
+                };
                 let payload = load_stack_field(&mut builder, &local_state, depth - 1, 8);
                 builder.def_var(tag_variable, tag);
                 builder.def_var(payload_variable, payload);
                 let dirty = builder.ins().iconst(types::I8, 1);
                 builder.def_var(local_state.dirty, dirty);
-                jump_to(&mut builder, next, "store fallthrough")?;
+                continue_linear_block(&mut builder, bytecode_block, next, "store fallthrough")?;
             }
             Instruction::Add
             | Instruction::Sub
             | Instruction::Mul
             | Instruction::Div
             | Instruction::Mod => {
+                let known_tags = type_state
+                    .and_then(|state| {
+                        Some(exact_stack_tag_pair(
+                            state,
+                            depth.checked_sub(2)?,
+                            depth.checked_sub(1)?,
+                        ))
+                    })
+                    .flatten();
                 emit_numeric_binary(
                     &mut builder,
                     frame,
@@ -3004,6 +3548,7 @@ fn lower_function(
                     depth,
                     next.ok_or("binary fallthrough is missing")?,
                     &artifact.instructions[pc],
+                    known_tags,
                     helpers,
                 );
             }
@@ -3013,6 +3558,8 @@ fn lower_function(
             | Instruction::Le
             | Instruction::Gt
             | Instruction::Ge => {
+                let known_tags =
+                    type_state.and_then(|state| exact_stack_tag_pair(state, depth - 2, depth - 1));
                 emit_numeric_compare(
                     &mut builder,
                     frame,
@@ -3021,6 +3568,7 @@ fn lower_function(
                     depth,
                     next.ok_or("comparison fallthrough is missing")?,
                     &artifact.instructions[pc],
+                    known_tags,
                     helpers,
                 );
             }
@@ -3070,7 +3618,7 @@ fn lower_function(
                 }
             }
             Instruction::Jump(target) => {
-                let target_block = blocks
+                let target_block = block_for_pc
                     .get(target)
                     .copied()
                     .ok_or("jump target has no bytecode block")?;
@@ -3085,7 +3633,7 @@ fn lower_function(
                 );
             }
             Instruction::JumpIfNoPropagation(target) => {
-                let target_block = blocks
+                let target_block = block_for_pc
                     .get(target)
                     .copied()
                     .ok_or("propagation target has no bytecode block")?;
@@ -3130,7 +3678,7 @@ fn lower_function(
                     depth,
                     *target,
                     next,
-                    &blocks,
+                    &block_for_pc,
                     plan,
                     &artifact.instructions[pc],
                 )?;
@@ -3185,7 +3733,12 @@ fn lower_function(
                         },
                     );
                     store_stack_field(&mut builder, &local_state, depth - 1, 8, payload);
-                    jump_to(&mut builder, next, "type-test fallthrough")?;
+                    continue_linear_block(
+                        &mut builder,
+                        bytecode_block,
+                        next,
+                        "type-test fallthrough",
+                    )?;
                 } else if matches!(value_type, ValueType::Enum(_) | ValueType::Variant(_)) {
                     emit_variant_type_test(
                         &mut builder,
@@ -3247,11 +3800,18 @@ fn lower_function(
             }
             Instruction::Dup => {
                 copy_stack_slot(&mut builder, &local_state, depth - 1, depth);
-                jump_to(&mut builder, next, "dup fallthrough")?;
+                continue_linear_block(&mut builder, bytecode_block, next, "dup fallthrough")?;
             }
-            Instruction::Pop => jump_to(&mut builder, next, "pop fallthrough")?,
+            Instruction::Pop => {
+                continue_linear_block(&mut builder, bytecode_block, next, "pop fallthrough")?
+            }
             Instruction::StackTruncate(_) => {
-                jump_to(&mut builder, next, "stack truncate fallthrough")?;
+                continue_linear_block(
+                    &mut builder,
+                    bytecode_block,
+                    next,
+                    "stack truncate fallthrough",
+                )?;
             }
             Instruction::Swap => {
                 let a_tag = load_stack_field(&mut builder, &local_state, depth - 1, 0);
@@ -3262,7 +3822,7 @@ fn lower_function(
                 store_stack_field(&mut builder, &local_state, depth - 1, 8, b_payload);
                 store_stack_field(&mut builder, &local_state, depth - 2, 0, a_tag);
                 store_stack_field(&mut builder, &local_state, depth - 2, 8, a_payload);
-                jump_to(&mut builder, next, "swap fallthrough")?;
+                continue_linear_block(&mut builder, bytecode_block, next, "swap fallthrough")?;
             }
             Instruction::ConstrainArrayFrom => {
                 // For scalars the VM operation preserves the assigned value.
@@ -3479,6 +4039,19 @@ fn jump_to(
     Ok(())
 }
 
+fn continue_linear_block(
+    builder: &mut FunctionBuilder<'_>,
+    current: cranelift_codegen::ir::Block,
+    target: Option<cranelift_codegen::ir::Block>,
+    context: &'static str,
+) -> Result<(), String> {
+    let target = target.ok_or(context)?;
+    if target != current {
+        builder.ins().jump(target, &[]);
+    }
+    Ok(())
+}
+
 fn slot_address(
     builder: &mut FunctionBuilder<'_>,
     frame: cranelift_codegen::ir::Value,
@@ -3675,8 +4248,52 @@ fn emit_numeric_binary(
     depth: usize,
     next: cranelift_codegen::ir::Block,
     instruction: &Instruction,
+    known_tags: Option<(u64, u64)>,
     helpers: JitHelperRefs,
 ) {
+    if let Some((left_tag, right_tag)) = known_tags {
+        match (left_tag, right_tag, instruction) {
+            (TAG_INT, TAG_INT, _) => emit_integer_binary_kind(
+                builder,
+                frame,
+                local_state,
+                pc,
+                depth,
+                next,
+                instruction,
+                TAG_INT,
+                true,
+            ),
+            (TAG_UINT, TAG_UINT, _) => emit_integer_binary_kind(
+                builder,
+                frame,
+                local_state,
+                pc,
+                depth,
+                next,
+                instruction,
+                TAG_UINT,
+                false,
+            ),
+            (
+                TAG_FLOAT,
+                TAG_FLOAT,
+                Instruction::Add | Instruction::Sub | Instruction::Mul | Instruction::Div,
+            ) => {
+                emit_float_binary(builder, frame, local_state, pc, depth, next, instruction);
+            }
+            _ => emit_exit(
+                builder,
+                frame,
+                local_state,
+                pc,
+                depth,
+                EXIT_RESUME,
+                REASON_NORMAL,
+            ),
+        }
+        return;
+    }
     let left_tag = load_stack_field(builder, local_state, depth - 2, 0);
     let right_tag = load_stack_field(builder, local_state, depth - 1, 0);
     let left_is_int = builder
@@ -4647,8 +5264,106 @@ fn emit_numeric_compare(
     depth: usize,
     next: cranelift_codegen::ir::Block,
     instruction: &Instruction,
+    known_tags: Option<(u64, u64)>,
     helpers: JitHelperRefs,
 ) {
+    if let Some((left_tag, right_tag)) = known_tags
+        && left_tag == right_tag
+        && matches!(
+            left_tag,
+            TAG_INT | TAG_UINT | TAG_FLOAT | TAG_CHAR | TAG_BOOL | TAG_NIL
+        )
+        && (!matches!(left_tag, TAG_BOOL | TAG_NIL)
+            || matches!(instruction, Instruction::Eq | Instruction::Ne))
+    {
+        let left = load_stack_field(builder, local_state, depth - 2, 8);
+        let right = load_stack_field(builder, local_state, depth - 1, 8);
+        let result = match (left_tag, instruction) {
+            (TAG_INT, Instruction::Eq) => builder.ins().icmp(IntCC::Equal, left, right),
+            (TAG_INT, Instruction::Ne) => builder.ins().icmp(IntCC::NotEqual, left, right),
+            (TAG_INT, Instruction::Lt) => builder.ins().icmp(IntCC::SignedLessThan, left, right),
+            (TAG_INT, Instruction::Le) => {
+                builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThanOrEqual, left, right)
+            }
+            (TAG_INT, Instruction::Gt) => builder.ins().icmp(IntCC::SignedGreaterThan, left, right),
+            (TAG_INT, Instruction::Ge) => {
+                builder
+                    .ins()
+                    .icmp(IntCC::SignedGreaterThanOrEqual, left, right)
+            }
+            (TAG_UINT | TAG_CHAR, Instruction::Eq) => builder.ins().icmp(IntCC::Equal, left, right),
+            (TAG_UINT | TAG_CHAR, Instruction::Ne) => {
+                builder.ins().icmp(IntCC::NotEqual, left, right)
+            }
+            (TAG_UINT | TAG_CHAR, Instruction::Lt) => {
+                builder.ins().icmp(IntCC::UnsignedLessThan, left, right)
+            }
+            (TAG_UINT | TAG_CHAR, Instruction::Le) => {
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedLessThanOrEqual, left, right)
+            }
+            (TAG_UINT | TAG_CHAR, Instruction::Gt) => {
+                builder.ins().icmp(IntCC::UnsignedGreaterThan, left, right)
+            }
+            (TAG_UINT | TAG_CHAR, Instruction::Ge) => {
+                builder
+                    .ins()
+                    .icmp(IntCC::UnsignedGreaterThanOrEqual, left, right)
+            }
+            (TAG_FLOAT, Instruction::Eq) => {
+                let left = builder.ins().bitcast(types::F64, MemFlagsData::new(), left);
+                let right = builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), right);
+                builder.ins().fcmp(FloatCC::Equal, left, right)
+            }
+            (TAG_FLOAT, Instruction::Ne) => {
+                let left = builder.ins().bitcast(types::F64, MemFlagsData::new(), left);
+                let right = builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), right);
+                builder.ins().fcmp(FloatCC::NotEqual, left, right)
+            }
+            (TAG_FLOAT, Instruction::Lt) => {
+                let left = builder.ins().bitcast(types::F64, MemFlagsData::new(), left);
+                let right = builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), right);
+                builder.ins().fcmp(FloatCC::LessThan, left, right)
+            }
+            (TAG_FLOAT, Instruction::Le) => {
+                let left = builder.ins().bitcast(types::F64, MemFlagsData::new(), left);
+                let right = builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), right);
+                builder.ins().fcmp(FloatCC::LessThanOrEqual, left, right)
+            }
+            (TAG_FLOAT, Instruction::Gt) => {
+                let left = builder.ins().bitcast(types::F64, MemFlagsData::new(), left);
+                let right = builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), right);
+                builder.ins().fcmp(FloatCC::GreaterThan, left, right)
+            }
+            (TAG_FLOAT, Instruction::Ge) => {
+                let left = builder.ins().bitcast(types::F64, MemFlagsData::new(), left);
+                let right = builder
+                    .ins()
+                    .bitcast(types::F64, MemFlagsData::new(), right);
+                builder.ins().fcmp(FloatCC::GreaterThanOrEqual, left, right)
+            }
+            (TAG_BOOL, Instruction::Eq) => builder.ins().icmp(IntCC::Equal, left, right),
+            (TAG_BOOL, Instruction::Ne) => builder.ins().icmp(IntCC::NotEqual, left, right),
+            (TAG_NIL, Instruction::Eq) => builder.ins().iconst(types::I8, 1),
+            (TAG_NIL, Instruction::Ne) => builder.ins().iconst(types::I8, 0),
+            _ => unreachable!("filtered comparison type and operator"),
+        };
+        emit_compare_result(builder, local_state, depth, next, result);
+        return;
+    }
     let left_tag = load_stack_field(builder, local_state, depth - 2, 0);
     let right_tag = load_stack_field(builder, local_state, depth - 1, 0);
     let left_is_int = builder
@@ -5169,9 +5884,9 @@ fn emit_integer_float_ordering(
         .ins()
         .select(integer_equal, truncated_greater, integer_greater);
     let in_range_less = builder.ins().band(in_range, inner_less);
-    let less = builder.ins().bor(below, in_range_less);
+    let less = builder.ins().bor(above, in_range_less);
     let in_range_greater = builder.ins().band(in_range, inner_greater);
-    let greater = builder.ins().bor(above, in_range_greater);
+    let greater = builder.ins().bor(below, in_range_greater);
     let trunc_match = builder.ins().band(integer_equal, truncated_equal);
     let equal = builder.ins().band(in_range, trunc_match);
     (less, equal, greater)
@@ -5388,6 +6103,102 @@ fn emit_conditional_jump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jit_bytecode_blocks_coalesce_linear_instructions() {
+        let artifact = CompiledProgram {
+            instructions: vec![
+                Instruction::Push(Value::Int(1)),
+                Instruction::Store(0),
+                Instruction::Add,
+                Instruction::Push(Value::Int(2)),
+                Instruction::Store(0),
+                Instruction::JumpIfFalse(8),
+                Instruction::Pop,
+                Instruction::Jump(9),
+                Instruction::Push(Value::Int(3)),
+                Instruction::Return,
+            ],
+            ..CompiledProgram::default()
+        };
+        let plan = FunctionPlan {
+            entry: 0,
+            end: artifact.instructions.len(),
+            instruction_count: artifact.instructions.len(),
+            block_count: 4,
+            edge_count: 0,
+            phi_estimate: 0,
+            local_count: 1,
+            max_stack: 1,
+            stack_depths: vec![Some(0); artifact.instructions.len()],
+            osr_entries: vec![1],
+            has_backedges: false,
+            callable_from_jit: false,
+        };
+        let reachable = vec![true; artifact.instructions.len()];
+        let type_states = infer_jit_type_states(&plan, &artifact);
+
+        assert_eq!(
+            jit_bytecode_block_starts(&plan, &artifact, &reachable, &type_states)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            [0, 1, 3, 6, 8, 9]
+        );
+    }
+
+    #[test]
+    fn jit_type_dataflow_tracks_checked_integer_loop_state() {
+        let artifact = CompiledProgram {
+            instructions: vec![
+                Instruction::Store(0),
+                Instruction::Load(0),
+                Instruction::Push(Value::Int(1)),
+                Instruction::Add,
+                Instruction::Store(0),
+                Instruction::Jump(1),
+            ],
+            callables: BTreeMap::from([(
+                0,
+                crate::backend::CallableSignature {
+                    parameters: 1,
+                    captures: 0,
+                    asynchronous: false,
+                    parameter_types: Some(vec![Some(RuntimeType::Int)]),
+                    result_type: None,
+                },
+            )]),
+            ..CompiledProgram::default()
+        };
+        let plan = FunctionPlan {
+            entry: 0,
+            end: artifact.instructions.len(),
+            instruction_count: artifact.instructions.len(),
+            block_count: 2,
+            edge_count: 1,
+            phi_estimate: 0,
+            local_count: 1,
+            max_stack: 2,
+            stack_depths: vec![Some(1), Some(0), Some(1), Some(2), Some(1), Some(0)],
+            osr_entries: vec![1],
+            has_backedges: true,
+            callable_from_jit: false,
+        };
+
+        let states = infer_jit_type_states(&plan, &artifact);
+        let entry = states[0].as_ref().expect("entry state is reachable");
+        assert_eq!(entry.stack, [Some(TAG_INT)]);
+        let loop_state = states[1].as_ref().expect("loop state is reachable");
+        assert_eq!(loop_state.locals, [Some(TAG_INT)]);
+        let add_state = states[3].as_ref().expect("integer addition is reachable");
+        assert_eq!(
+            exact_stack_tag_pair(add_state, 0, 1),
+            Some((TAG_INT, TAG_INT))
+        );
+        assert_eq!(
+            states[1].as_ref().map(|state| state.locals[0]),
+            Some(Some(TAG_INT))
+        );
+    }
 
     #[test]
     fn enum_type_tests_use_registered_tags_and_fall_back_past_the_code_cap() {

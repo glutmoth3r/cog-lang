@@ -870,6 +870,121 @@ ret
 }
 
 #[test]
+fn jit_typed_parameter_guard_resumes_vm_for_error_values() {
+    let source = r#"
+call main 0
+call emit_value 1
+pop
+halt
+
+.function main 0 0
+main:
+push 0
+store 0
+loop:
+load 0
+call increment 1
+pop
+load 0
+push 1
+add
+dup
+store 0
+push 160
+lt
+jnz loop
+push 1
+push 0
+div
+call increment 1
+ret
+
+.function increment 1 0
+increment:
+store 0
+load 0
+push 1
+add
+ret
+
+.function emit_value 1 0
+emit_value:
+store 0
+call_native io::stdout
+load 0
+call_native bytes::render
+store 1
+load 1
+push 0
+load 1
+call_native bytes::len
+call_native io::write_all
+dup
+is_type error
+jnz emit_done
+pop
+call_native io::stdout
+call_native io::flush
+emit_done:
+ret
+"#;
+    let mut artifact = cog::parser::assemble(source).expect("typed guard fixture should assemble");
+    let main_entry = *artifact
+        .callables
+        .keys()
+        .next()
+        .expect("fixture should declare main");
+    let main_end = artifact
+        .callables
+        .range((
+            std::ops::Bound::Excluded(main_entry),
+            std::ops::Bound::Unbounded,
+        ))
+        .next()
+        .map_or(artifact.instructions.len(), |(entry, _)| *entry);
+    let increment_entry = artifact.instructions[main_entry..main_end]
+        .iter()
+        .find_map(|instruction| match instruction {
+            cog::instruction::Instruction::Call(target, 1) => Some(*target),
+            _ => None,
+        })
+        .expect("main should call increment");
+    artifact
+        .callables
+        .get_mut(&increment_entry)
+        .expect("increment should have a call contract")
+        .parameter_types = Some(vec![Some(cog::value::RuntimeType::Int)]);
+    let profile_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-typed-guard-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile_path);
+    let run = |jit| {
+        let mut output = Vec::new();
+        let mut context = RuntimeContext::new(&mut output, VmCapabilities::default());
+        context.configure_jit(jit, jit.then_some(profile_path.as_path()), false);
+        interpreter::run_with_context(&artifact, &mut context)
+            .map_err(|error| error.to_string())?;
+        drop(context);
+        String::from_utf8(output).map_err(|error| error.to_string())
+    };
+    let vm_output = run(false).expect("interpreter fixture should complete");
+    let jit_output = run(true).expect("typed JIT guard should resume in the interpreter");
+    assert_eq!(jit_output, vm_output);
+
+    let profile: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&profile_path).expect("hot increment should compile"),
+    )
+    .expect("APE profile should be valid JSON");
+    assert!(
+        profile["functions"][increment_entry.to_string()]["compile_ns"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    );
+    let _ = std::fs::remove_file(profile_path);
+}
+
+#[test]
 fn jit_osr_reads_distinct_scalar_captures_from_closure_instances() {
     assert_jit_matches_vm(
         CAPTURED_CLOSURE_SOURCE,
@@ -1036,7 +1151,52 @@ fn jit_mixed_signed_unsigned_comparisons_match_vm_at_boundaries() {
 
 #[test]
 fn jit_mixed_integer_float_comparisons_match_vm_at_exact_boundaries() {
-    assert_jit_matches_vm_computed(MIXED_INTEGER_FLOAT_COMPARE_SOURCE, "mixed-int-float");
+    let artifact = project::compile_source(
+        "jit-mixed-int-float.cog",
+        MIXED_INTEGER_FLOAT_COMPARE_SOURCE,
+    )
+    .expect("mixed comparison fixture should compile");
+    let expected_types = [
+        Some(cog::value::RuntimeType::Int),
+        Some(cog::value::RuntimeType::Float),
+        Some(cog::value::RuntimeType::Int),
+    ];
+    let signed_score_entry = artifact
+        .callables
+        .iter()
+        .find_map(|(&entry, signature)| {
+            signature
+                .parameter_types
+                .as_ref()
+                .is_some_and(|types| types.as_slice() == expected_types.as_slice())
+                .then_some(entry)
+        })
+        .expect("signed_score should have int/float/int parameter types");
+    let profile_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!("jit-mixed-int-float-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&profile_path);
+
+    let vm_output = execute(MIXED_INTEGER_FLOAT_COMPARE_SOURCE, false, None);
+    let jit_output = execute(
+        MIXED_INTEGER_FLOAT_COMPARE_SOURCE,
+        true,
+        Some(&profile_path),
+    );
+    assert_eq!(jit_output, vm_output);
+
+    let profile: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&profile_path).expect("signed_score should persist its JIT profile"),
+    )
+    .expect("APE profile should be valid JSON");
+    assert!(
+        profile["functions"][signed_score_entry.to_string()]["jit_ns_per_backedge"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "signed_score must execute in native code for this regression"
+    );
+    let _ = std::fs::remove_file(profile_path);
 }
 
 #[test]
