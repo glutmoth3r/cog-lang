@@ -215,6 +215,15 @@ impl BuildInputs {
         Ok(bytes)
     }
 
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        self.reads
+            .borrow()
+            .states
+            .keys()
+            .map(|(base, path)| base.join(path))
+            .collect()
+    }
+
     pub(crate) fn validate(&self, bytes: &[u8]) -> bool {
         if bytes.len() > MAX_RECORD_BYTES {
             return false;

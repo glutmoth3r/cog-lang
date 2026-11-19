@@ -69,6 +69,9 @@ the compiler rejects calls that expose const aliases to these mutations. Trusted
 callbacks must honor the declared mutations and effects, including changes through
 captured aliases. Parameter tags are the coarse native types in the C header,
 not nominal Cog struct identities or the complete source annotation grammar.
+Reference-like results from registered native functions are conservatively
+read-only because a callback may return an alias of an existing value. Use
+`.clone()` when an independent writable copy is needed and supported.
 All typed boundaries retain runtime checks. A typed Error argument bypasses the
 callback and propagates; `Any` can inspect/return it. A wrong successful return
 type, callback error or caught panic becomes the catchable `err::Error::NativeFailure`.
@@ -89,6 +92,10 @@ creation/access/mutation. Other VM categories can be retained and passed back un
 raw resource pointers, arbitrary record construction or custom host-pointer
 values. Release retained
 graphs when no longer needed. Unreachable Cog graph cycles are traced by the VM.
+
+Task handles belong to the individual run that created them. Returning a retained
+task to a later run does not give access to that run's tasks; attempting to use
+the foreign handle produces a catchable invalid-argument Error.
 
 Callable values belong to the exact `Program` instance that produced them.
 They can be retained and returned on later runs of that instance, including

@@ -14,7 +14,7 @@ use std::ops::Deref;
 use std::rc::{Rc, Weak};
 
 use crate::error::RuntimeError;
-use crate::value::Value;
+use crate::value::{Value, WeakTaskHandle};
 
 pub(crate) trait HeapObject: Any {
     fn visit_values(&self, visit: &mut dyn FnMut(&Value));
@@ -48,6 +48,7 @@ pub(crate) struct ObjectKey {
 
 pub(crate) struct TaskRootSet<'a> {
     pub id: usize,
+    pub lease: &'a WeakTaskHandle,
     pub strong_count: usize,
     pub values: Vec<&'a Value>,
 }
@@ -445,7 +446,7 @@ pub(crate) fn unreachable_task_roots(
             incoming: 0,
             edges: Vec::new(),
         });
-        task_indices.insert(root.id, index);
+        task_indices.insert(root.id, (index, root.lease));
     }
 
     let mut object_indices = HashMap::new();
@@ -455,7 +456,7 @@ pub(crate) fn unreachable_task_roots(
             resource: "async task roots",
         })?;
     for root in roots {
-        let from = task_indices[&root.id];
+        let from = task_indices[&root.id].0;
         for value in &root.values {
             add_task_value_edges(from, value, &task_indices, &mut nodes)?;
             add_heap_value_edges(from, value, &mut nodes, &mut object_indices)?;
@@ -542,7 +543,7 @@ pub(crate) fn unreachable_task_roots(
 fn add_task_value_edges(
     from: usize,
     value: &Value,
-    task_indices: &HashMap<usize, usize>,
+    task_indices: &HashMap<usize, (usize, &WeakTaskHandle)>,
     nodes: &mut [TaskGraphNode],
 ) -> Result<(), RuntimeError> {
     let mut values = Vec::new();
@@ -557,7 +558,9 @@ fn add_task_value_edges(
         while let Some(value) = values.pop() {
             match value {
                 Value::Task(task) => {
-                    if let Some(&target) = task_indices.get(&task.id()) {
+                    if let Some(&(target, lease)) = task_indices.get(&task.id())
+                        && lease.matches(task)
+                    {
                         add_task_graph_edge(from, target, nodes)?;
                     }
                 }
@@ -902,6 +905,44 @@ mod tests {
 
     use super::*;
     use crate::value::{ArrayValue, ClosureCaptures, RecordValue};
+
+    #[test]
+    fn foreign_task_with_reused_id_does_not_hide_a_live_task_root() {
+        use crate::value::TaskHandle;
+        use std::cell::Cell;
+        use std::sync::mpsc;
+
+        let (local_sender, _) = mpsc::channel();
+        let (foreign_sender, _) = mpsc::channel();
+        let local = TaskHandle::new(2, local_sender, Rc::new(Cell::new(false)));
+        let foreign = TaskHandle::new(2, foreign_sender, Rc::new(Cell::new(false)));
+        let foreign_value = Value::Task(foreign);
+        let lease = local.downgrade();
+        let roots = [TaskRootSet {
+            id: 2,
+            lease: &lease,
+            strong_count: lease.strong_count(),
+            values: vec![&foreign_value],
+        }];
+        assert!(unreachable_task_roots(&roots).unwrap().is_empty());
+
+        let local_value = Value::Task(local.clone());
+        let roots = [TaskRootSet {
+            id: 2,
+            lease: &lease,
+            strong_count: lease.strong_count(),
+            values: vec![&local_value],
+        }];
+        assert!(unreachable_task_roots(&roots).unwrap().is_empty());
+        drop(local);
+        let roots = [TaskRootSet {
+            id: 2,
+            lease: &lease,
+            strong_count: lease.strong_count(),
+            values: vec![&local_value],
+        }];
+        assert_eq!(unreachable_task_roots(&roots).unwrap(), vec![2]);
+    }
 
     #[test]
     fn collection_work_ignores_retired_slots_after_a_heap_peak() {

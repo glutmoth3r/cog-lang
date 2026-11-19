@@ -34,6 +34,204 @@ fn output(body: &str, expected: &str) {
 }
 
 #[test]
+fn inline_and_defer_preserve_contextual_numeric_literals() {
+    output(
+        r#"
+        fn automatic(value: uint) -> uint { value + 1 }
+        @inline("never") fn ordinary(value: uint) -> uint { value + 1 }
+        fn automatic_big(value: bigint) -> bigint { value + 1 }
+        @inline("never") fn ordinary_big(value: bigint) -> bigint { value + 1 }
+        fn main() {
+            const unsigned: uint = "2" as uint;
+            const large: bigint = "2" as bigint;
+            io::println(automatic(unsigned));
+            io::println(ordinary(unsigned));
+            io::println(automatic_big(large));
+            io::println(ordinary_big(large));
+            var value: uint = "2" as uint;
+            defer { io::println(value); }
+            defer { value += 1; }
+        }
+        "#,
+        "3\n3\n3\n3\n3\n",
+    );
+}
+
+#[test]
+fn nullable_refinement_does_not_cross_loop_backedges_or_mutable_captures() {
+    for body in [
+        r#"
+        fn required(value: int) -> int { value + 1 }
+        fn probe(value: int?) {
+            when value is nil { return; }
+            var index = 0;
+            while index < 2 {
+                io::println(required(value));
+                value = nil;
+                index += 1;
+            }
+        }
+        fn main() { probe(10); }
+        "#,
+        r#"
+        fn probe(current: int?) {
+            when current is nil { return; }
+            const read = fn[var current]() -> int { current };
+            current = nil;
+            io::println((read)());
+        }
+        fn main() { probe(10); }
+        "#,
+    ] {
+        rejects_semantically(body, &["type"]);
+    }
+}
+
+#[test]
+fn awaited_reference_cannot_make_a_const_alias_writable() {
+    rejects_semantically(
+        r#"
+        @async fn identity(value: int[]) -> int[] { value }
+        @async fn main() {
+            const protected = [10];
+            var alias = [1];
+            alias = await identity(protected);
+            alias << 99;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn deferred_async_writes_cannot_be_erased_by_a_later_store() {
+    rejects_semantically(
+        r#"
+        @async fn save(holder, value) -> nil { holder.item = value; }
+        @async fn main() {
+            const protected = [10];
+            var holder = {item: [1]};
+            const pending = save(holder, protected);
+            holder.item = [2];
+            await pending;
+            holder.item << 99;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn deferred_async_mutation_cannot_reach_a_later_const_alias() {
+    rejects_semantically(
+        r#"
+        @async fn change(holder) -> nil { holder.item[0] = 99; }
+        @async fn main() {
+            const protected = [10];
+            var holder = {item: [1]};
+            const pending = change(holder);
+            holder.item = protected;
+            await pending;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn deferred_async_mutation_cannot_reach_a_later_global_const_alias() {
+    rejects_semantically(
+        r#"
+        var holder = {item: [1]};
+        @async fn change() -> nil { holder.item[0] = 99; }
+        @async fn main() {
+            const protected = [10];
+            const pending = change();
+            holder.item = protected;
+            await pending;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn deferred_async_global_rebinding_retains_const_aliases() {
+    rejects_semantically(
+        r#"
+        var shared = [1];
+        @async fn save(value) -> nil { shared = value; }
+        @async fn main() {
+            const protected = [10];
+            const pending = save(protected);
+            shared = [2];
+            await pending;
+            shared << 99;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn deferred_async_method_mutation_cannot_reach_a_later_const_alias() {
+    rejects_semantically(
+        r#"
+        struct Holder { item: int[] }
+        extend Holder {
+            @async fn change(mut self) -> nil { self.item[0] = 99; }
+        }
+        @async fn main() {
+            const protected = [10];
+            var holder = Holder([1]);
+            const pending = holder.change();
+            holder.item = protected;
+            await pending;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
+fn mutable_capture_cannot_upgrade_const_aliases_before_or_after_a_call() {
+    for body in [
+        r#"
+        fn main() {
+            const protected = [10];
+            var current = [1];
+            const mutate = fn[var current]() -> nil { current[0] = 99; };
+            current = protected;
+            (mutate)();
+        }
+        "#,
+        r#"
+        fn main() {
+            const protected = [10];
+            var current = [1];
+            const rebind = fn[var current, protected]() -> nil { current = protected; };
+            (rebind)();
+            current[0] = 99;
+        }
+        "#,
+        r#"
+        fn make(value: int[]) -> fn() -> nil {
+            var current = value;
+            const mutate = fn[var current]() -> nil { current[0] = 99; };
+            mutate
+        }
+        fn main() {
+            const protected = [10];
+            const mutate = make(protected);
+            (mutate)();
+        }
+        "#,
+    ] {
+        rejects_semantically(body, &["read-only"]);
+    }
+}
+
+#[test]
 fn mutable_closure_capture_supports_compound_assignment() {
     output(
         r#"

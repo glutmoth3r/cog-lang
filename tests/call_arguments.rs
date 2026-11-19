@@ -37,6 +37,35 @@ fn mixed_arguments_evaluate_once_in_source_order_then_defaults() {
 }
 
 #[test]
+fn default_closures_and_methods_keep_their_checked_declaration_context() {
+    assert_eq!(
+        run(r#"
+        struct Item { value: int }
+        extend Item { fn get(self) -> int { self.value } }
+        struct Container {
+            callback: fn(int) -> int = fn[](value: int) -> int { value + 1 },
+            value: int = Item(42).get(),
+        }
+        fn choose(value: int = Item(42).get()) -> int { value }
+        fn call(callback: fn(int) -> int = fn[](value: int) -> int { value + 1 }) -> int {
+            (callback)(41)
+        }
+        fn main() {
+            const first = Container();
+            const second = Container();
+            io::println(call());
+            io::println(call());
+            io::println((first.callback)(41));
+            io::println((second.callback)(41));
+            io::println(first.value);
+            io::println(choose());
+        }
+        "#),
+        "42\n42\n42\n42\n42\n42\n"
+    );
+}
+
+#[test]
 fn trailing_commas_work_in_all_existing_delimited_lists() {
     assert_eq!(
         run(r#"

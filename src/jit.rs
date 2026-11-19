@@ -5522,9 +5522,17 @@ fn emit_numeric_compare(
             .ins()
             .icmp_imm_s(IntCC::Equal, right_tag, TAG_UNINITIALIZED as i64);
     let uninitialized = builder.ins().bor(left_uninitialized, right_uninitialized);
+    let left_error = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, left_tag, TAG_ERROR as i64);
+    let right_error = builder
+        .ins()
+        .icmp_imm_s(IntCC::Equal, right_tag, TAG_ERROR as i64);
+    let error = builder.ins().bor(left_error, right_error);
+    let invalid = builder.ins().bor(uninitialized, error);
     builder
         .ins()
-        .brif(uninitialized, fallback, &[], nil_valid_block, &[]);
+        .brif(invalid, fallback, &[], nil_valid_block, &[]);
 
     builder.switch_to_block(nil_valid_block);
     let both_nil = builder.ins().band(left_is_nil, right_is_nil);

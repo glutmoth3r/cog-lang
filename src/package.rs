@@ -1492,6 +1492,7 @@ fn build_archive_with_target(
     let output = crate::build::resolve_build_path(&output)?;
     let mut plan = package_plan(&prepared, &packages, selected_target.as_deref())?;
     protect_archive_output(&prepared, &plan, &output)?;
+    let build_inputs = prepared.build_inputs.clone();
 
     let mut engine = crate::sdk::Engine::new();
     for (_, manifest) in &prepared.plugins {
@@ -1515,6 +1516,7 @@ fn build_archive_with_target(
         warnings
     };
 
+    crate::build::protect_build_inputs(&build_inputs, &output)?;
     let entries = plan.entries.len();
     let archive_bytes = write_archive(&output, std::mem::take(&mut plan.entries))?;
     Ok(BuildResult {

@@ -226,8 +226,14 @@ name]` shares a mutable local through a cell. A copied capture may hold a shared
 reference value; its binding is read-only, while mutations through other writable
 aliases remain visible. Nested captures are explicit, and forwarding a mutable
 capture requires a mutable capture in every enclosing closure. Capture bodies are
-checked for read-only violations even when the closure is not called. Closure
-parameter and result types must be explicit. Named function values require fully
+checked for read-only violations even when the closure is not called. Mutation
+effects on enclosing parameters and globals are conservatively checked
+when the closure is created. A shared mutable capture cannot be rebound to a
+reference graph containing read-only access, even if the closure is never called.
+Possible closure writes to captured graphs and globals are joined into the
+surrounding analysis at creation, including writes on early-return paths; this
+can reject a safe mutation even when the closure is never called.
+Closure parameter and result types must be explicit. Named function values require fully
 annotated, synchronous, non-generic signatures without defaults. Async and
 comptime closures and implicit capture remain unsupported. Callback calls retain
 the VM's call/error boundary; the JIT roots captured values and resumes at dynamic
@@ -235,7 +241,11 @@ callback dispatch or the first unsupported operation. Closure captures are trace
 by the regular cycle collector. Until callable effect types exist, indirect calls
 conservatively treat reference arguments as potentially mutated and reference
 results as read-only; `.clone()` can produce an independent writable copy when
-supported. Compiler quota exhaustion must be distinguished from a program's
+supported. Reference-like results obtained through `await` are likewise treated
+as read-only until task result aliasing is represented precisely. Objects that
+may be mutated by an async task conservatively retain that possibility even if
+the task is not started or has already completed. Storing read-only references
+into such objects is rejected. Compiler quota exhaustion must be distinguished from a program's
 computational ResourceLimit; the evaluator's precise quota contract is open.
 
 Conceptually main is the first user Runtime function after compilation, evaluation,

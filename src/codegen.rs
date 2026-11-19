@@ -231,15 +231,15 @@ fn mutable_capture_names(block: &Block) -> HashSet<String> {
 }
 
 #[derive(Clone)]
-struct InlineFunction {
+struct InlineFunction<'a> {
     parameters: Vec<Param>,
-    bindings: Vec<Stmt>,
-    body: Expr,
+    bindings: Vec<&'a Stmt>,
+    body: &'a Expr,
     nodes: usize,
     mode: InlineMode,
 }
 
-fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction> {
+fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction<'_>> {
     let mut functions = HashMap::new();
     for item in &program.items {
         let candidates: Vec<&FunctionDecl> = match item {
@@ -312,7 +312,7 @@ fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction
                     break;
                 }
                 available_names.push(name.clone());
-                bindings.push(statement.clone());
+                bindings.push(statement);
             }
             if !supported || !is_inlineable_body(body, &available_names, &mut nodes) {
                 continue;
@@ -322,7 +322,7 @@ fn collect_inline_functions(program: &Program) -> HashMap<String, InlineFunction
                 InlineFunction {
                     parameters: function.params.clone(),
                     bindings,
-                    body: body.clone(),
+                    body,
                     nodes,
                     mode: function.inline,
                 },
@@ -636,8 +636,8 @@ impl Scopes {
 }
 
 #[derive(Clone)]
-struct FunctionSig {
-    params: Vec<Param>,
+struct FunctionSig<'a> {
+    params: &'a [Param],
     visibility: Visibility,
     module: Option<String>,
     asynchronous: bool,
@@ -653,7 +653,7 @@ struct GlobalSig {
 #[derive(Clone)]
 struct Deferred {
     id: Label,
-    body: Block,
+    body: std::ptr::NonNull<Block>,
     scopes: Scopes,
 }
 
@@ -776,7 +776,7 @@ fn runtime_type(annotation: &crate::ast::TypeAnnotation) -> Option<RuntimeType> 
 }
 
 struct Codegen<'a> {
-    functions: &'a HashMap<String, FunctionSig>,
+    functions: &'a HashMap<String, FunctionSig<'a>>,
     method_calls: &'a HashMap<crate::analysis::CallSite, String>,
     iteration_calls:
         &'a HashMap<crate::analysis::CallSite, Vec<Option<crate::analysis::IterationMethods>>>,
@@ -785,15 +785,15 @@ struct Codegen<'a> {
     uint_literals: &'a std::collections::HashSet<usize>,
     uint_expressions: &'a std::collections::HashSet<usize>,
     bigint_literals: &'a std::collections::HashSet<usize>,
-    inline_functions: HashMap<String, InlineFunction>,
+    inline_functions: HashMap<String, InlineFunction<'a>>,
     inline_nodes_remaining: usize,
     closures: Vec<ClosureDef>,
     next_closure: usize,
     current_function: Option<String>,
     current_module: Option<String>,
-    struct_defs: HashMap<String, Vec<crate::ast::StructField>>,
+    struct_defs: HashMap<String, &'a [crate::ast::StructField]>,
     struct_visibility: HashMap<String, Visibility>,
-    enum_defs: HashMap<String, EnumVariant>,
+    enum_defs: HashMap<String, &'a EnumVariant>,
     enum_visibility: HashMap<String, Visibility>,
     globals: &'a HashMap<String, GlobalSig>,
     declaration_uses: &'a [crate::ast::UseDecl],
@@ -898,9 +898,9 @@ fn compile_with_modules_and_names(
         return Err(CodegenError::from_diagnostics(checked.diagnostics));
     }
     let mut functions: HashMap<String, FunctionSig> = HashMap::new();
-    let mut struct_defs: HashMap<String, Vec<crate::ast::StructField>> = HashMap::new();
+    let mut struct_defs: HashMap<String, &[crate::ast::StructField]> = HashMap::new();
     let mut struct_visibility: HashMap<String, Visibility> = HashMap::new();
-    let mut enum_defs: HashMap<String, EnumVariant> = HashMap::new();
+    let mut enum_defs: HashMap<String, &EnumVariant> = HashMap::new();
     let mut enum_visibility: HashMap<String, Visibility> = HashMap::new();
     let mut globals: HashMap<String, GlobalSig> = HashMap::new();
     let mut global_indices: HashMap<String, usize> = HashMap::new();
@@ -916,7 +916,7 @@ fn compile_with_modules_and_names(
                     .insert(
                         f.name.clone(),
                         FunctionSig {
-                            params: f.params.clone(),
+                            params: &f.params,
                             visibility: f.visibility,
                             module: function_modules
                                 .get(&f.name)
@@ -942,7 +942,7 @@ fn compile_with_modules_and_names(
                     functions.insert(
                         function.name.clone(),
                         FunctionSig {
-                            params: function.params.clone(),
+                            params: &function.params,
                             visibility: function.visibility,
                             module: function
                                 .name
@@ -1007,7 +1007,7 @@ fn compile_with_modules_and_names(
                 ..
             } => {
                 if type_params.is_empty() {
-                    struct_defs.insert(name.clone(), fields.clone());
+                    struct_defs.insert(name.clone(), fields);
                     struct_visibility.insert(name.clone(), *visibility);
                 }
             }
@@ -1019,7 +1019,7 @@ fn compile_with_modules_and_names(
                 enum_visibility.insert(name.clone(), *visibility);
                 for variant in variants {
                     let key = format!("{}::{}", name, variant.name);
-                    enum_defs.insert(key, variant.clone());
+                    enum_defs.insert(key, variant);
                 }
             }
             Item::Use(use_decl) => {
@@ -1416,7 +1416,7 @@ impl<'a> Codegen<'a> {
                 Stmt::Defer { body } => {
                     let cleanup = Deferred {
                         id: self.fresh_label("defer"),
-                        body: body.clone(),
+                        body: std::ptr::NonNull::from(body),
                         scopes: scopes.clone(),
                     };
                     local_deferred.push(cleanup.clone());
@@ -1536,7 +1536,8 @@ impl<'a> Codegen<'a> {
         } else {
             None
         };
-        let result = self.compile_block_with_deferred(&cleanup.body, scopes, pending);
+        let body = unsafe { cleanup.body.as_ref() };
+        let result = self.compile_block_with_deferred(body, scopes, pending);
         if let Some(boundary) = boundary {
             self.out.bind(boundary.label);
         }
@@ -1632,7 +1633,7 @@ impl<'a> Codegen<'a> {
             Stmt::Defer { body } => {
                 deferred.push(Deferred {
                     id: self.fresh_label("defer"),
-                    body: body.clone(),
+                    body: std::ptr::NonNull::from(body),
                     scopes: scopes.clone(),
                 });
             }
@@ -2682,7 +2683,12 @@ impl<'a> Codegen<'a> {
                         .extend([Instruction::Push(Value::Nil), Instruction::Store(slot)]);
                 }
             } else if let Some(default) = &field.default {
-                self.compile_default(default, module.clone(), scopes)?;
+                self.compile_default(
+                    default,
+                    module.clone(),
+                    matches!(target, DeclaredCall::Function).then_some(name),
+                    scopes,
+                )?;
             } else {
                 return Err(CodegenError::new(format!(
                     "`{name}` expects argument `{}`",
@@ -2758,7 +2764,7 @@ impl<'a> Codegen<'a> {
             if let Some(argument) = args.get(index - 1) {
                 self.compile_call_argument(argument, parameter.ty.as_ref(), scopes)?;
             } else if let Some(default) = &parameter.default {
-                self.compile_default(default, module.clone(), scopes)?;
+                self.compile_default(default, module.clone(), Some(name), scopes)?;
             } else {
                 return Err(CodegenError::new(format!(
                     "`{name}` expects argument `{}`",
@@ -2783,9 +2789,12 @@ impl<'a> Codegen<'a> {
         &mut self,
         value: &Expr,
         module: Option<String>,
+        function: Option<&str>,
         caller: &mut Scopes,
     ) -> Result<(), CodegenError> {
         let previous = std::mem::replace(&mut self.current_module, module);
+        let previous_function =
+            std::mem::replace(&mut self.current_function, function.map(str::to_owned));
         let mut context = Scopes::new();
         for decl in self.declaration_uses {
             self.apply_use_decl(decl, &mut context)?;
@@ -2794,6 +2803,7 @@ impl<'a> Codegen<'a> {
         let result = self.compile_expr(value, &mut context);
         caller.next_slot = context.next_slot;
         self.current_module = previous;
+        self.current_function = previous_function;
         result
     }
 

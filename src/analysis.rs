@@ -4376,8 +4376,10 @@ impl<'a> Checker<'a> {
                 }
             }
             Stmt::While { cond, body } => {
+                self.invalidate_mutable_flow_facts();
                 let condition = self.condition(cond);
                 let loop_flow = self.flow_facts.clone();
+                self.invalidate_mutable_flow_facts();
                 self.loops += 1;
                 self.loop_breaks.push(false);
                 self.block(body);
@@ -4412,6 +4414,7 @@ impl<'a> Checker<'a> {
                     start.span(),
                 );
                 let loop_flow = self.flow_facts.clone();
+                self.invalidate_mutable_flow_facts();
                 self.loops += 1;
                 self.loop_breaks.push(false);
                 self.block(body);
@@ -4469,6 +4472,7 @@ impl<'a> Checker<'a> {
                     );
                 }
                 let loop_flow = self.flow_facts.clone();
+                self.invalidate_mutable_flow_facts();
                 self.loops += 1;
                 self.loop_breaks.push(false);
                 self.block(body);
@@ -4551,6 +4555,7 @@ impl<'a> Checker<'a> {
                     );
                 }
                 let loop_flow = self.flow_facts.clone();
+                self.invalidate_mutable_flow_facts();
                 self.loops += 1;
                 self.loop_breaks.push(false);
                 self.block(body);
@@ -5482,7 +5487,11 @@ impl<'a> Checker<'a> {
                         );
                         valid = false;
                     }
-                    let ty = self.effective_type(&binding);
+                    let ty = if capture.mutable {
+                        binding.ty.clone()
+                    } else {
+                        self.effective_type(&binding)
+                    };
                     capture_bindings.push((capture.name.clone(), ty, capture.mutable));
                 }
                 let mut parameter_types = Vec::with_capacity(params.len());

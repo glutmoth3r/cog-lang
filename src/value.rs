@@ -1751,6 +1751,10 @@ impl TaskHandle {
 }
 
 impl WeakTaskHandle {
+    pub(crate) fn matches(&self, handle: &TaskHandle) -> bool {
+        Weak::ptr_eq(&self.0, &Rc::downgrade(&handle.0))
+    }
+
     pub(crate) fn strong_count(&self) -> usize {
         self.0.strong_count()
     }

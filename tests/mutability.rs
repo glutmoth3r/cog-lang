@@ -232,6 +232,70 @@ fn capabilities_follow_global_reassignment_across_calls() {
 }
 
 #[test]
+fn closure_heap_and_global_stores_preserve_readonly_aliases() {
+    for body in [
+        r#"
+        fn main() {
+            const protected = [10];
+            var holder = {item: [1]};
+            const install = fn[var holder, protected]() -> nil { holder.item = protected; };
+            (install)();
+            holder.item << 99;
+        }
+        "#,
+        r#"
+        fn make(holder, value) -> fn() -> nil {
+            var current = holder;
+            const install = fn[var current, value]() -> nil { current.item = value; };
+            install
+        }
+        fn main() {
+            const protected = [10];
+            var holder = {item: [1]};
+            const install = make(holder, protected);
+            (install)();
+            holder.item << 99;
+        }
+        "#,
+        r#"
+        var shared = [1];
+        fn main() {
+            const protected = [10];
+            const install = fn[protected]() -> nil { shared = protected; };
+            (install)();
+            shared << 99;
+        }
+        "#,
+        r#"
+        fn main() {
+            const protected = [10];
+            var holder = {item: [1]};
+            const install = fn[var holder, protected](flag: bool) -> nil {
+                if flag { holder.item = protected; return; }
+            };
+            (install)(true);
+            holder.item << 99;
+        }
+        "#,
+    ] {
+        rejects(body, "cannot mutate");
+    }
+    assert_eq!(
+        run(r#"
+        fn main() {
+            var holder = {item: [1]};
+            var value = [10];
+            const install = fn[var holder, var value]() -> nil { holder.item = value; };
+            (install)();
+            holder.item << 99;
+            io::println(value);
+        }
+        "#),
+        "[10, 99]\n"
+    );
+}
+
+#[test]
 fn terminal_helpers_and_infinite_loops_do_not_justify_unreachable_writes() {
     rejects(
         "fn stop() { crash(\"stop\"); } fn main() { var a = [1]; stop(); a << 2; }",

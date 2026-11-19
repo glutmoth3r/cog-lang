@@ -275,6 +275,10 @@ impl NativeImport {
         matches!(&self.0, NativeCode::Registered(function) if function.asynchronous)
     }
 
+    pub(crate) fn is_registered(&self) -> bool {
+        matches!(&self.0, NativeCode::Registered(_))
+    }
+
     pub(crate) fn validate_arguments(&self, arguments: &[Value]) -> Result<(), RuntimeError> {
         if arguments.len() != self.parameters().len() {
             return Err(RuntimeError::InvalidNativeCall);

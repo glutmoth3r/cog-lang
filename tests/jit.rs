@@ -1229,6 +1229,33 @@ fn jit_nullable_type_test_and_boolean_ops_match_vm() {
 }
 
 #[test]
+fn jit_nil_equality_preserves_errors_in_both_operands() {
+    let template = r#"
+        @!include("std")
+        use io;
+        fn probe(count: int) {
+            const failure: int? = "bad" as int;
+            var index = 0;
+            var swallowed = 0;
+            while index < count {
+                when COMPARISON is bool { swallowed += 1; }
+                index += 1;
+            }
+            swallowed
+        }
+        fn main() { io::println(probe(6000)); }
+    "#;
+    for (suffix, comparison) in [
+        ("eq-left", "failure == nil"),
+        ("eq-right", "nil == failure"),
+        ("ne-left", "failure != nil"),
+        ("ne-right", "nil != failure"),
+    ] {
+        assert_jit_fallback_matches_vm(&template.replace("COMPARISON", comparison), suffix, "0\n");
+    }
+}
+
+#[test]
 fn jit_enum_and_variant_type_tests_match_vm() {
     assert_jit_matches_vm(JIT_ENUM_TYPE_SOURCE, "enum-types", "18000\n30000\n");
 }

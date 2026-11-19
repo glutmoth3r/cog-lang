@@ -1,6 +1,161 @@
 use cog::sdk::{Engine, RunContext, Signature, Type, Value};
 
 #[test]
+fn retained_task_cannot_cancel_a_task_from_a_later_run() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let saved = Rc::new(RefCell::new(None::<Value>));
+    let mut engine = Engine::new();
+    let retained = saved.clone();
+    engine
+        .register(
+            "host::save",
+            Signature::new(vec![Type::Any], Type::Nil),
+            move |_, arguments| {
+                *retained.borrow_mut() = Some(arguments[0].clone());
+                Ok(Value::nil())
+            },
+        )
+        .unwrap();
+    let retained = saved.clone();
+    engine
+        .register(
+            "host::load",
+            Signature::new(vec![], Type::Any),
+            move |_, _| Ok(retained.borrow().as_ref().unwrap().clone()),
+        )
+        .unwrap();
+    let first = engine
+        .compile(
+            "save.cog",
+            r#"
+            @!include("std") use host;
+            @async fn original() -> int { 11 }
+            @async fn main() { host::save(original()); }
+        "#,
+        )
+        .unwrap();
+    engine
+        .decode(&first.encode().unwrap())
+        .unwrap()
+        .run(&mut Vec::new())
+        .unwrap();
+    let second = engine
+        .compile(
+            "load.cog",
+            r#"
+            @!include("std") use host; use io; use err::Error;
+            @async fn unrelated() -> int { 22 }
+            @async fn main() {
+                const fresh = unrelated();
+                const stale = host::load();
+                when cancel(stale) is Error { io::println("foreign"); }
+                io::println(await fresh);
+            }
+        "#,
+        )
+        .unwrap();
+    let mut output = Vec::new();
+    engine
+        .decode(&second.encode().unwrap())
+        .unwrap()
+        .run(&mut output)
+        .unwrap();
+    assert_eq!(output, b"foreign\n22\n");
+}
+
+#[test]
+fn foreign_task_in_cold_task_does_not_hide_a_live_root_during_collection() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let retained = Rc::new(RefCell::new(None::<Value>));
+    let mut engine = Engine::new();
+    let saved = retained.clone();
+    engine
+        .register(
+            "host::save",
+            Signature::new(vec![Type::Any], Type::Nil),
+            move |_, arguments| {
+                *saved.borrow_mut() = Some(arguments[0].clone());
+                Ok(Value::nil())
+            },
+        )
+        .unwrap();
+    let saved = retained.clone();
+    engine
+        .register(
+            "host::load",
+            Signature::new(vec![], Type::Any),
+            move |_, _| Ok(saved.borrow().as_ref().unwrap().clone()),
+        )
+        .unwrap();
+    let first = engine
+        .compile(
+            "save.cog",
+            r#"
+            @!include("std") use host;
+            @async fn original() -> int { 11 }
+            @async fn main() { host::save(original()); }
+        "#,
+        )
+        .unwrap();
+    engine
+        .decode(&first.encode().unwrap())
+        .unwrap()
+        .run(&mut Vec::new())
+        .unwrap();
+    let second = engine
+        .compile(
+            "collect.cog",
+            r#"
+            @!include("std") use host; use io;
+            @async fn active(value) -> int { 22 }
+            @async fn main() {
+                const fresh = active(host::load());
+                var index = 0;
+                while index < 600 {
+                    const item = [index];
+                    index = item[0] + 1;
+                }
+                io::println(await fresh);
+            }
+        "#,
+        )
+        .unwrap();
+    let mut output = Vec::new();
+    engine
+        .decode(&second.encode().unwrap())
+        .unwrap()
+        .run(&mut output)
+        .unwrap();
+    assert_eq!(output, b"22\n");
+}
+
+#[test]
+fn native_reference_result_cannot_make_a_const_alias_writable() {
+    let mut engine = Engine::new();
+    engine
+        .register(
+            "host::identity",
+            Signature::new(vec![Type::Array], Type::Array),
+            |_, arguments| Ok(arguments[0].clone()),
+        )
+        .unwrap();
+    let source = r#"
+        @!include("std") use host;
+        fn main() {
+            const protected = [10];
+            var alias = host::identity(protected);
+            alias << 99;
+        }
+    "#;
+    let error = engine.compile("native-alias.cog", source).err().unwrap();
+    assert!(error.message().contains("read-only"), "{error}");
+}
+
+#[test]
 fn registered_callbacks_round_trip_and_outlive_the_engine() {
     let mut engine = Engine::new();
     engine

@@ -124,6 +124,7 @@ type Heap = BTreeMap<Path, Access>;
 #[derive(Clone, PartialEq, Eq)]
 struct Binding {
     mutable: bool,
+    shared: bool,
     value: Access,
 }
 #[derive(Clone)]
@@ -139,6 +140,7 @@ struct State<'a> {
     heap: Heap,
     allocations: BTreeSet<Root>,
     many: BTreeSet<Root>,
+    deferred_roots: BTreeSet<Root>,
     defers: Vec<Deferred<'a>>,
     alive: bool,
 }
@@ -151,6 +153,7 @@ impl Default for State<'_> {
             heap: BTreeMap::new(),
             allocations: BTreeSet::new(),
             many: BTreeSet::new(),
+            deferred_roots: BTreeSet::new(),
             defers: vec![],
             alive: true,
         }
@@ -160,10 +163,15 @@ impl State<'_> {
     fn join(&mut self, other: &Self) {
         self.allocations.extend(other.allocations.iter().cloned());
         self.many.extend(other.many.iter().cloned());
+        self.deferred_roots
+            .extend(other.deferred_roots.iter().cloned());
         for (id, b) in &other.bindings {
             self.bindings
                 .entry(*id)
-                .and_modify(|v| v.value.union(&b.value))
+                .and_modify(|v| {
+                    v.shared |= b.shared;
+                    v.value.union(&b.value);
+                })
                 .or_insert_with(|| b.clone());
         }
         for (name, b) in &other.globals {
@@ -207,6 +215,7 @@ struct Summary {
     globals: BTreeMap<String, Access>,
     allocations: BTreeSet<Root>,
     many: BTreeSet<Root>,
+    deferred_roots: BTreeSet<Root>,
 }
 impl Summary {
     fn join(&mut self, other: Self) {
@@ -215,6 +224,7 @@ impl Summary {
         self.returned.union(&other.returned);
         self.allocations.extend(other.allocations);
         self.many.extend(other.many);
+        self.deferred_roots.extend(other.deferred_roots);
         for (path, value) in other.heap {
             self.heap.entry(path).or_default().union(&value);
         }
@@ -439,7 +449,14 @@ impl<'a> Pass<'a> {
             .unwrap_or(ValueKind::Reference)
     }
     fn define(&mut self, name: &str, id: usize, mutable: bool, value: Access) {
-        self.state.bindings.insert(id, Binding { mutable, value });
+        self.state.bindings.insert(
+            id,
+            Binding {
+                mutable,
+                shared: false,
+                value,
+            },
+        );
         self.state
             .scopes
             .last_mut()
@@ -473,6 +490,7 @@ impl<'a> Pass<'a> {
                     name.clone(),
                     Binding {
                         mutable: matches!(item, Item::GlobalVar { .. }),
+                        shared: false,
                         value: Access::root(Root::Global(name.clone())),
                     },
                 );
@@ -532,6 +550,9 @@ impl<'a> Pass<'a> {
     }
     fn save_heap(&mut self) {
         self.summary.many.extend(self.state.many.iter().cloned());
+        self.summary
+            .deferred_roots
+            .extend(self.state.deferred_roots.iter().cloned());
         for (path, access) in &self.state.heap {
             self.summary
                 .heap
@@ -636,7 +657,36 @@ impl<'a> Pass<'a> {
         }
         result
     }
+    fn retain_deferred_store(&mut self, access: &Access, value: &Access) {
+        if access
+            .refs
+            .iter()
+            .any(|reference| self.state.deferred_roots.contains(&reference.path.root))
+        {
+            let reachable = self.project(value, &Key::Descendant);
+            if self.emit
+                && self.state.alive
+                && reachable
+                    .refs
+                    .iter()
+                    .any(|reference| !reference.readonly.is_empty())
+            {
+                self.diagnostics.push(Diagnostic::new(
+                    "E1003",
+                    "cannot store const/read-only access into an object with deferred async mutations",
+                    self.location.clone(),
+                ));
+            }
+            self.state.deferred_roots.extend(
+                reachable
+                    .refs
+                    .into_iter()
+                    .map(|reference| reference.path.root),
+            );
+        }
+    }
     fn store(&mut self, access: &Access, key: Key, value: Access, strong: bool) {
+        self.retain_deferred_store(access, &value);
         let strong =
             strong && access.refs.len() == 1 && !matches!(key, Key::AnyIndex | Key::Descendant);
         for reference in &access.refs {
@@ -774,6 +824,21 @@ impl<'a> Pass<'a> {
                             if self.state.bindings[&id].mutable
                                 && self.kind(value) != ValueKind::Invalid
                             {
+                                if self.state.bindings[&id].shared {
+                                    let reachable = self.project(&access, &Key::Descendant);
+                                    if reachable
+                                        .refs
+                                        .iter()
+                                        .any(|reference| !reference.readonly.is_empty())
+                                        && self.emit
+                                    {
+                                        self.diagnostics.push(Diagnostic::new(
+                                            "E1003",
+                                            format!("cannot assign const/read-only access to mutable capture `{name}`"),
+                                            value.span().cloned().or_else(|| self.location.clone()),
+                                        ));
+                                    }
+                                }
                                 if self.state.alive {
                                     self.mutated.insert(id);
                                 }
@@ -789,7 +854,20 @@ impl<'a> Pass<'a> {
                             if self.state.alive
                                 && self.state.globals.get(&name).is_some_and(|b| b.mutable)
                             {
-                                self.state.globals.get_mut(&name).unwrap().value = access.clone();
+                                self.retain_deferred_store(
+                                    &Access::root(Root::Global(name.clone())),
+                                    &access,
+                                );
+                                let deferred = self
+                                    .state
+                                    .deferred_roots
+                                    .contains(&Root::Global(name.clone()));
+                                let binding = self.state.globals.get_mut(&name).unwrap();
+                                if deferred {
+                                    binding.value.union(&access);
+                                } else {
+                                    binding.value = access.clone();
+                                }
                                 self.summary.globals.entry(name).or_default().union(&access);
                             }
                         }
@@ -1115,6 +1193,7 @@ impl<'a> Pass<'a> {
                 || (before.bindings == self.state.bindings
                     && before.allocations == self.state.allocations
                     && before.many == self.state.many
+                    && before.deferred_roots == self.state.deferred_roots
                     && before.heap == self.state.heap
                     && before.globals == self.state.globals)
             {
@@ -1169,6 +1248,10 @@ impl<'a> Pass<'a> {
         body: &'a Block,
         captured_values: Vec<Access>,
     ) {
+        let captured_bindings = captures
+            .iter()
+            .map(|capture| self.local_id(&capture.name))
+            .collect::<Vec<_>>();
         let closure_state = State {
             bindings: BTreeMap::new(),
             scopes: vec![HashMap::new()],
@@ -1176,6 +1259,7 @@ impl<'a> Pass<'a> {
             heap: self.state.heap.clone(),
             allocations: self.state.allocations.clone(),
             many: self.state.many.clone(),
+            deferred_roots: self.state.deferred_roots.clone(),
             defers: Vec::new(),
             alive: true,
         };
@@ -1201,10 +1285,17 @@ impl<'a> Pass<'a> {
                 capture.mutable,
                 value,
             );
+            if capture.mutable {
+                self.state
+                    .bindings
+                    .get_mut(&(capture as *const ClosureCapture as usize))
+                    .unwrap()
+                    .shared = true;
+            }
         }
-        for (index, parameter) in params.iter().enumerate() {
+        for parameter in params {
             let value = if parameter.ty.as_ref().is_none_or(annotation_may_reference) {
-                Access::root(Root::Parameter(index))
+                Access::root(Root::Fresh(parameter as *const Param as usize, 0))
             } else {
                 Access::default()
             };
@@ -1215,11 +1306,38 @@ impl<'a> Pass<'a> {
                 value,
             );
         }
+        self.observations.push(self.state.clone());
         self.block(body);
+        let mut closure_state = self.observations.pop().unwrap();
+        closure_state.join(&self.state);
+        for (path, value) in &self.summary.heap {
+            closure_state
+                .heap
+                .entry(path.clone())
+                .or_default()
+                .union(value);
+        }
+        let captured_updates = captures
+            .iter()
+            .zip(captured_bindings)
+            .filter_map(|(capture, outer_id)| {
+                if !capture.mutable {
+                    return None;
+                }
+                let id = capture as *const ClosureCapture as usize;
+                Some((outer_id?, closure_state.bindings.get(&id)?.value.clone()))
+            })
+            .collect::<Vec<_>>();
+        closure_state.bindings.clear();
+        let closure_globals = self.summary.globals.clone();
+        let closure_mutations = self
+            .summary
+            .mutations
+            .iter()
+            .filter(|path| matches!(path.root, Root::Parameter(_) | Root::Global(_)))
+            .cloned()
+            .collect::<BTreeSet<_>>();
 
-        // Closure bodies are checked as their own functions. Keep their local
-        // `var` checks and diagnostics, but do not apply deferred effects to the
-        // function that merely creates the closure.
         let closure_local_ids = self.locals.keys().copied().collect::<BTreeSet<_>>();
         let closure_locals = std::mem::take(&mut self.locals);
         let closure_mutated = self
@@ -1236,7 +1354,17 @@ impl<'a> Pass<'a> {
             .collect::<BTreeSet<_>>();
 
         self.state = outer_state;
+        self.state.join(&closure_state);
+        for (id, value) in captured_updates {
+            if let Some(binding) = self.state.bindings.get_mut(&id) {
+                binding.value.union(&value);
+            }
+        }
         self.summary = outer_summary;
+        self.summary.mutations.extend(closure_mutations);
+        for (name, value) in closure_globals {
+            self.summary.globals.entry(name).or_default().union(&value);
+        }
         self.loops = outer_loops;
         self.observations = outer_observations;
         self.locals = outer_locals;
@@ -1282,6 +1410,7 @@ impl<'a> Pass<'a> {
                     {
                         self.attempted.insert(id);
                         self.mutated.insert(id);
+                        self.state.bindings.get_mut(&id).unwrap().shared = true;
                     }
                 }
                 self.closure_body(captures, params, body, captured_values);
@@ -1387,7 +1516,8 @@ impl<'a> Pass<'a> {
                     let mut call_arguments = Vec::with_capacity(arguments.len() + 1);
                     call_arguments.push(value);
                     call_arguments.extend(arguments);
-                    return self.apply_summary(expr, summary, &call_arguments);
+                    let name = name.clone();
+                    return self.apply_call_summary(expr, &name, summary, &call_arguments);
                 }
                 if mutating_call {
                     self.mutate(&value, receiver);
@@ -1511,6 +1641,15 @@ impl<'a> Pass<'a> {
                     }
                 };
                 self.branches(known, |_| access, |p| p.expr(fallback))
+            }
+            Expr::Unary(UnOp::Await, value) => {
+                self.expr(value);
+                if self.kind(expr) == ValueKind::Reference {
+                    self.allocate(Root::Fresh(expr_id(expr), 0))
+                        .readonly("await result")
+                } else {
+                    Access::default()
+                }
             }
             Expr::Unary(_, value) | Expr::Cast(value, _) => {
                 self.expr(value);
@@ -1672,12 +1811,80 @@ impl<'a> Pass<'a> {
             if name == "fmt::write" {
                 return args.first().cloned().unwrap_or_default();
             }
-            return self.allocate(Root::Fresh(expr_id(expr), 0));
+            let result = self.allocate(Root::Fresh(expr_id(expr), 0));
+            return if import.is_registered() {
+                result.readonly("native call result")
+            } else {
+                result
+            };
         }
         if let Some(summary) = summary {
-            return self.apply_summary(expr, summary, &args);
+            return self.apply_call_summary(expr, &name, summary, &args);
         }
         Access::default()
+    }
+
+    fn apply_call_summary(
+        &mut self,
+        expr: &Expr,
+        name: &str,
+        summary: Summary,
+        args: &[Access],
+    ) -> Access {
+        let asynchronous = self
+            .functions
+            .get(name)
+            .is_some_and(|function| function.asynchronous);
+        let deferred_mutations = if asynchronous {
+            let mut mutations = summary
+                .mutations
+                .iter()
+                .filter_map(|path| match &path.root {
+                    Root::Parameter(index) => args.get(*index).cloned(),
+                    Root::Global(name) => {
+                        let mut access = self.substitute(
+                            &Path {
+                                root: path.root.clone(),
+                                keys: vec![],
+                            },
+                            args,
+                            expr_id(expr),
+                        );
+                        access.union(&Access::root(Root::Global(name.clone())));
+                        Some(access)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            for name in summary.globals.keys() {
+                let root = Root::Global(name.clone());
+                let mut access = self.substitute(
+                    &Path {
+                        root: root.clone(),
+                        keys: vec![],
+                    },
+                    args,
+                    expr_id(expr),
+                );
+                access.union(&Access::root(root));
+                mutations.push(access);
+            }
+            mutations
+        } else {
+            Vec::new()
+        };
+        let result = self.apply_summary(expr, summary, args);
+        for access in deferred_mutations {
+            let reachable = self.project(&access, &Key::Descendant);
+            let roots = reachable
+                .refs
+                .into_iter()
+                .map(|reference| reference.path.root)
+                .collect::<BTreeSet<_>>();
+            self.state.many.extend(roots.iter().cloned());
+            self.state.deferred_roots.extend(roots);
+        }
+        result
     }
 
     fn apply_summary(&mut self, expr: &Expr, summary: Summary, args: &[Access]) -> Access {
@@ -1720,6 +1927,23 @@ impl<'a> Pass<'a> {
                 .entry(name.clone())
                 .or_default()
                 .union(&value);
+        }
+        for root in &summary.deferred_roots {
+            let access = self.substitute(
+                &Path {
+                    root: root.clone(),
+                    keys: vec![],
+                },
+                args,
+                site,
+            );
+            let reachable = self.project(&access, &Key::Descendant);
+            self.state.deferred_roots.extend(
+                reachable
+                    .refs
+                    .into_iter()
+                    .map(|reference| reference.path.root),
+            );
         }
         let result = self.substitute_access(&summary.returned, args, site);
         if !summary.returns {

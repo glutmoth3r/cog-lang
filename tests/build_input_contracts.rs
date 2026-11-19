@@ -382,6 +382,46 @@ fn build_10_required_input_failure_invalidates_a_warm_successful_cache() {
 }
 
 #[test]
+fn build_output_cannot_overwrite_a_comptime_input() {
+    let inputs = Inputs::new();
+    inputs.write("input.txt", b"original input");
+    inputs.program("include_str", "");
+    let output = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .current_dir(&inputs.0)
+        .args(["build", "main.cog", "-o", "input.txt"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("overwrite a project input"));
+    assert_eq!(
+        std::fs::read(inputs.0.join("input.txt")).unwrap(),
+        b"original input"
+    );
+}
+
+#[test]
+fn package_output_cannot_overwrite_a_comptime_input() {
+    let inputs = Inputs::new();
+    inputs.write("input.txt", b"original input");
+    inputs.program("include_str", "");
+    std::fs::create_dir(inputs.0.join("src")).unwrap();
+    std::fs::rename(inputs.0.join("main.cog"), inputs.0.join("src/main.cog")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_cog"))
+        .current_dir(&inputs.0)
+        .args(["package", "build", ".", "-o", "input.txt"])
+        .env("NO_COLOR", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("overwrite a project input"));
+    assert_eq!(
+        std::fs::read(inputs.0.join("input.txt")).unwrap(),
+        b"original input"
+    );
+}
+
+#[test]
 fn build_paths_use_project_root_or_explicit_file_invocation_directory() {
     let inputs = Inputs::new();
     std::fs::create_dir(inputs.0.join("child")).unwrap();

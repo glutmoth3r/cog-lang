@@ -212,6 +212,7 @@ pub fn project_with_warnings(
         &loaded.build_inputs,
     )?;
     let dependencies = loaded.build_inputs.encode()?;
+    protect_build_inputs(&loaded.build_inputs, artifact)?;
     let inputs = with_dependencies(inputs, &dependencies);
     let bytes = bytecode::encode(&compiled)?;
     let program = program(&bytes)?;
@@ -231,6 +232,22 @@ pub fn project_with_warnings(
         },
         warnings,
     ))
+}
+
+pub(crate) fn protect_build_inputs(
+    inputs: &crate::build_inputs::BuildInputs,
+    artifact: &Path,
+) -> Result<(), String> {
+    let output = resolve_build_path(artifact)?;
+    for input in inputs.paths() {
+        if same_build_path(&resolve_build_path(&input)?, &output) {
+            return Err(format!(
+                "output would overwrite a project input: {}",
+                artifact.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn protect_project_inputs(prepared: &Prepared, artifact: &Path) -> Result<(), String> {

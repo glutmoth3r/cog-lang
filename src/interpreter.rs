@@ -579,6 +579,19 @@ struct AsyncScheduler {
 }
 
 impl AsyncScheduler {
+    fn task_id(&self, handle: &TaskHandle) -> Result<usize, RuntimeError> {
+        let id = handle.id();
+        if self
+            .tasks
+            .get(&id)
+            .is_some_and(|task| task.lease.matches(handle))
+        {
+            Ok(id)
+        } else {
+            Err(RuntimeError::InvalidArgument { op: "async task" })
+        }
+    }
+
     fn new(
         execution_plan: Option<Rc<VmExecutionPlan>>,
         io_completion_channel: Option<(Sender<AsyncIoCompletion>, Receiver<AsyncIoCompletion>)>,
@@ -1017,6 +1030,7 @@ impl AsyncScheduler {
                 task.target.append_captured_values(&mut values)?;
                 roots.push(TaskRootSet {
                     id,
+                    lease: &task.lease,
                     strong_count: task.lease.strong_count(),
                     values,
                 });
@@ -1298,7 +1312,7 @@ impl AsyncScheduler {
         waiter: usize,
         awaited: TaskHandle,
     ) -> Result<Option<Value>, RuntimeError> {
-        let target = awaited.id();
+        let target = self.task_id(&awaited)?;
         let (completed, is_running) = match self
             .tasks
             .get(&target)
@@ -1435,7 +1449,7 @@ impl AsyncScheduler {
         globals: &mut Vec<Option<Value>>,
         remaining_steps: &mut Option<u64>,
     ) -> Result<Value, RuntimeError> {
-        let id = task_handle.id();
+        let id = self.task_id(&task_handle)?;
         let is_running = self
             .tasks
             .get(&id)
@@ -1831,7 +1845,10 @@ impl AsyncScheduler {
                 }),
             );
         };
-        let target = task_handle.id();
+        let target = match self.task_id(&task_handle) {
+            Ok(target) => target,
+            Err(error) => return self.complete_task(id, Err(error)),
+        };
         let target_outcome = match self
             .tasks
             .get(&target)
@@ -2023,7 +2040,10 @@ impl AsyncScheduler {
         let mut parent = None;
         let mut completed_winner: Option<(u64, usize)> = None;
         for (index, handle) in handles.iter().enumerate() {
-            let target = handle.id();
+            let target = match self.task_id(handle) {
+                Ok(target) => target,
+                Err(error) => return self.complete_task(id, Err(error)),
+            };
             if seen.insert(target) {
                 targets.push((target, index));
             }
@@ -5188,13 +5208,15 @@ fn execute_vm(
                     } else {
                         match value {
                             Value::Error(_) => stack.push(value),
-                            Value::Task(task) => match scheduler.spawn(task.id()) {
-                                Ok(()) => stack.push(Value::Task(task)),
-                                Err(error) if error.is_recoverable() => {
-                                    stack.push(Value::Error(Box::new(error)))
+                            Value::Task(task) => {
+                                match scheduler.task_id(&task).and_then(|id| scheduler.spawn(id)) {
+                                    Ok(()) => stack.push(Value::Task(task)),
+                                    Err(error) if error.is_recoverable() => {
+                                        stack.push(Value::Error(Box::new(error)))
+                                    }
+                                    Err(error) => return Err(error),
                                 }
-                                Err(error) => return Err(error),
-                            },
+                            }
                             _ => stack.push(Value::Error(Box::new(RuntimeError::TypeMismatch {
                                 op: "spawn",
                             }))),
@@ -5205,7 +5227,10 @@ fn execute_vm(
                     let value = stack.pop().ok_or(RuntimeError::StackUnderflow)?;
                     match value {
                         Value::Error(_) => stack.push(value),
-                        Value::Task(task) => match scheduler.cancel_task(task.id()) {
+                        Value::Task(task) => match scheduler
+                            .task_id(&task)
+                            .and_then(|id| scheduler.cancel_task(id))
+                        {
                             Ok(cancelled) => stack.push(Value::Bool(cancelled)),
                             Err(error) if error.is_recoverable() => {
                                 stack.push(Value::Error(Box::new(error)))
