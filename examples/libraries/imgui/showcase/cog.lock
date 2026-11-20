@@ -1,0 +1,7 @@
+COGLOCK 1
+root 0
+pkg 0 "cog-imgui-showcase" "0.1.0" path "."
+pkg 1 "cog-imgui" "0.1.0" path "target/.cog-package-cache/d91b0345e2aab68365a0252dfc35a4869f9d8f63281532bd9c0f464be816eeb7"
+pkg 2 "cog-sdl" "0.13.0" path "target/.cog-package-cache/d91b0345e2aab68365a0252dfc35a4869f9d8f63281532bd9c0f464be816eeb7/.cog/packages/1"
+dep 0 "binding" 1
+dep 1 "sdl_lib" 2

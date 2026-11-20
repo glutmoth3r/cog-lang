@@ -1,0 +1,64 @@
+// Typed event codes used by the SDL + ImGui workbench.
+public enum EventKind {
+    None, Quit, KeyDown, KeyUp, TextInput, MouseMove, MouseButtonDown,
+    MouseButtonUp, MouseWheel, WindowResized, FocusGained, FocusLost,
+    ControllerAxisMotion, ControllerButtonDown, ControllerButtonUp,
+    ControllerDeviceAdded, ControllerDeviceRemoved, ControllerDeviceRemapped,
+    TextEditing, DropFile, DropText, DropBegin, DropComplete,
+    Other(code: int),
+}
+
+public fn event_kind_from_code(code: int) -> EventKind {
+    if code == 0 { EventKind::None() }
+    else if code == 1 { EventKind::Quit() }
+    else if code == 2 { EventKind::KeyDown() }
+    else if code == 3 { EventKind::KeyUp() }
+    else if code == 4 { EventKind::TextInput() }
+    else if code == 5 { EventKind::MouseMove() }
+    else if code == 6 { EventKind::MouseButtonDown() }
+    else if code == 7 { EventKind::MouseButtonUp() }
+    else if code == 8 { EventKind::MouseWheel() }
+    else if code == 9 { EventKind::WindowResized() }
+    else if code == 10 { EventKind::FocusGained() }
+    else if code == 11 { EventKind::FocusLost() }
+    else if code == 13 { EventKind::ControllerAxisMotion() }
+    else if code == 14 { EventKind::ControllerButtonDown() }
+    else if code == 15 { EventKind::ControllerButtonUp() }
+    else if code == 16 { EventKind::ControllerDeviceAdded() }
+    else if code == 17 { EventKind::ControllerDeviceRemoved() }
+    else if code == 18 { EventKind::ControllerDeviceRemapped() }
+    else if code == 19 { EventKind::TextEditing() }
+    else if code == 20 { EventKind::DropFile() }
+    else if code == 21 { EventKind::DropText() }
+    else if code == 22 { EventKind::DropBegin() }
+    else if code == 23 { EventKind::DropComplete() }
+    else { EventKind::Other(code: code) }
+}
+
+public enum EventField {
+    RawType, Keycode, Scancode, Modifiers, Repeat, X, Y, DX, DY, Button,
+    Clicks, WheelX, WheelY, Width, Height, WindowEvent, WheelDirection,
+    ControllerAxis, ControllerAxisValue, ControllerButton,
+    ControllerInstanceId, ControllerDeviceIndex,
+    TextEditingStart, TextEditingLength,
+}
+
+public fn event_field_code(field: EventField) -> int {
+    match field {
+        EventField::RawType => 1, EventField::Keycode => 2,
+        EventField::Scancode => 3, EventField::Modifiers => 4,
+        EventField::Repeat => 5, EventField::X => 6, EventField::Y => 7,
+        EventField::DX => 8, EventField::DY => 9, EventField::Button => 10,
+        EventField::Clicks => 11, EventField::WheelX => 12,
+        EventField::WheelY => 13, EventField::Width => 14,
+        EventField::Height => 15, EventField::WindowEvent => 16,
+        EventField::WheelDirection => 17,
+        EventField::ControllerAxis => 18,
+        EventField::ControllerAxisValue => 19,
+        EventField::ControllerButton => 20,
+        EventField::ControllerInstanceId => 21,
+        EventField::ControllerDeviceIndex => 22,
+        EventField::TextEditingStart => 23,
+        EventField::TextEditingLength => 24,
+    }
+}

@@ -1,0 +1,102 @@
+@!include("std")
+@!include("sdl_lib")
+
+use sdl;
+use sdl_lib;
+
+fn main() -> nil {
+    sdl::open(160, 90, 8)!!;
+    sdl::set_title("Cog SDL event canvas")!!;
+    sdl::set_resizable(true)!!;
+    sdl::set_frame_limit(60)!!;
+    sdl::set_clear_color(17, 24, 39)!!;
+
+    const initial_width = sdl::drawable_width()!!;
+    const initial_height = sdl::drawable_height()!!;
+    var center_x = initial_width / 2;
+    var center_y = initial_height / 2;
+    var radius = 42;
+    var use_accent = false;
+    var should_close = false;
+
+    while !should_close {
+        var event_code = sdl::poll_event()!!;
+        while event_code != 0 {
+            const kind = sdl_lib::event_kind_from_code(event_code);
+            match kind {
+                sdl_lib::EventKind::Quit => { should_close = true; },
+                sdl_lib::EventKind::KeyDown => {
+                    const field = sdl_lib::event_field_code(
+                        sdl_lib::EventField::Scancode()
+                    );
+                    const code = sdl::event_value(field)!!;
+                    const key = sdl_lib::scancode_from_code(code);
+                    match key {
+                        sdl_lib::Scancode::Left => { center_x -= 24; },
+                        sdl_lib::Scancode::Right => { center_x += 24; },
+                        sdl_lib::Scancode::Up => { center_y -= 24; },
+                        sdl_lib::Scancode::Down => { center_y += 24; },
+                        sdl_lib::Scancode::C => { use_accent = !use_accent; },
+                        sdl_lib::Scancode::R => {
+                            center_x = initial_width / 2;
+                            center_y = initial_height / 2;
+                            radius = 42;
+                        },
+                        _ => {},
+                    }
+                },
+                sdl_lib::EventKind::MouseButtonDown => {
+                    const x_code = sdl_lib::event_field_code(sdl_lib::EventField::X());
+                    const y_code = sdl_lib::event_field_code(sdl_lib::EventField::Y());
+                    const window_x = sdl::event_value(x_code)!!;
+                    const window_y = sdl::event_value(y_code)!!;
+                    center_x = sdl::window_to_canvas_x(window_x)!!;
+                    center_y = sdl::window_to_canvas_y(window_y)!!;
+                },
+                sdl_lib::EventKind::MouseWheel => {
+                    const field = sdl_lib::event_field_code(sdl_lib::EventField::WheelY());
+                    radius += sdl::event_value(field)!! * 4;
+                    if radius < 12 { radius = 12; }
+                    if radius > 120 { radius = 120; }
+                },
+                _ => {},
+            }
+            event_code = sdl::poll_event()!!;
+        }
+
+        const width = sdl::drawable_width()!!;
+        const height = sdl::drawable_height()!!;
+        if center_x < 0 { center_x = 0; }
+        if center_y < 0 { center_y = 0; }
+        if center_x > width { center_x = width; }
+        if center_y > height { center_y = height; }
+
+        var red = 87;
+        var green = 207;
+        var blue = 180;
+        if use_accent {
+            red = 250;
+            green = 166;
+            blue = 82;
+        }
+
+        sdl::begin_frame()!!;
+        sdl::set_draw_color(42, 55, 76, 255)!!;
+        for column in 0..(width / 48 + 1) {
+            const x = column * 48;
+            sdl::draw_line(x, 64, x, height)!!;
+        }
+        for row in 0..(height / 48 + 1) {
+            const y = 64 + row * 48;
+            sdl::draw_line(0, y, width, y)!!;
+        }
+        sdl::set_draw_color(red, green, blue, 255)!!;
+        sdl::draw_circle(center_x, center_y, radius + 12)!!;
+        sdl::fill_circle(center_x, center_y, radius)!!;
+        sdl::set_draw_color(235, 241, 249, 255)!!;
+        sdl::draw_text("COG SDL EVENT CANVAS", 16, 12, 2)!!;
+        sdl::draw_text("ARROWS MOVE  CLICK JUMPS  WHEEL SCALES", 16, 30, 1)!!;
+        sdl::draw_text("C CHANGES COLOR  R RESETS", 16, 42, 1)!!;
+        sdl::end_frame()!!;
+    }
+}

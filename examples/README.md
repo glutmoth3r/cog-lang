@@ -40,6 +40,12 @@ working directory. Run it from the repository root. Each line stores one note
 with a `[ ]` or `[x]` completion marker. The example data file is included in
 the repository and starts empty.
 
+## External libraries
+
+Repository-specific showcases for raylib, SDL, cogweb, and ImGui are collected
+in [libraries/](libraries/README.md). Their project versions are `0.1.0`; each
+dependency is pinned to the latest library package version.
+
 ## Learning path
 
 | Example | What it demonstrates |

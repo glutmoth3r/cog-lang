@@ -1,0 +1,101 @@
+@!include("std")
+@!include("binding")
+
+use imgui;
+use sdl;
+use sdl_lib;
+
+fn event_field(field: sdl_lib::EventField) -> int {
+    sdl::event_value(sdl_lib::event_field_code(field))!!
+}
+
+fn forward_imgui_event(kind: int) -> nil {
+    var event_text = "";
+    match sdl_lib::event_kind_from_code(kind) {
+        sdl_lib::EventKind::TextInput => { event_text = sdl::event_text()!!; },
+        sdl_lib::EventKind::TextEditing => { event_text = sdl::event_edit_text()!!; },
+        _ => {},
+    }
+
+    imgui::process_event(
+        event_field(sdl_lib::EventField::RawType()),
+        [
+            event_field(sdl_lib::EventField::Keycode()),
+            event_field(sdl_lib::EventField::Scancode()),
+            event_field(sdl_lib::EventField::Modifiers()),
+            event_field(sdl_lib::EventField::Repeat()),
+            event_field(sdl_lib::EventField::X()),
+            event_field(sdl_lib::EventField::Y()),
+            event_field(sdl_lib::EventField::DX()),
+            event_field(sdl_lib::EventField::DY()),
+            event_field(sdl_lib::EventField::Button()),
+            event_field(sdl_lib::EventField::Clicks()),
+            event_field(sdl_lib::EventField::WheelX()),
+            event_field(sdl_lib::EventField::WheelY()),
+            event_field(sdl_lib::EventField::WheelDirection()),
+            event_field(sdl_lib::EventField::Width()),
+            event_field(sdl_lib::EventField::Height()),
+            event_field(sdl_lib::EventField::WindowEvent()),
+            event_field(sdl_lib::EventField::TextEditingStart()),
+            event_field(sdl_lib::EventField::TextEditingLength()),
+        ],
+        event_text
+    )!!;
+}
+
+fn main() -> nil {
+    sdl::open(100, 56, 12)!!;
+    sdl::set_title("Cog ImGui workbench")!!;
+    sdl::set_resizable(true)!!;
+    sdl::set_frame_limit(60)!!;
+    const window_id = sdl::window_id()!!;
+    imgui::attach(window_id)!!;
+
+    var should_close = false;
+    var show_diagnostics = true;
+    var particle_count = 240;
+    var workspace = "examples/libraries";
+    var rebuild_count = 0;
+    var capture_mouse = false;
+    var capture_keyboard = false;
+
+    while !should_close {
+        var kind_code = sdl::poll_event()!!;
+        while kind_code != 0 {
+            const kind = sdl_lib::event_kind_from_code(kind_code);
+            forward_imgui_event(kind_code);
+            match kind {
+                sdl_lib::EventKind::Quit => { should_close = true; },
+                _ => {},
+            }
+            kind_code = sdl::poll_event()!!;
+        }
+
+        sdl::begin_frame()!!;
+        imgui::begin_frame()!!;
+        const visible = imgui::begin_window("Cog project workbench")!!;
+        if visible {
+            imgui::text("Dear ImGui input and drawing are connected through cog-sdl.")!!;
+            imgui::text($"SDL window id: {window_id}")!!;
+            show_diagnostics = imgui::checkbox("Show input diagnostics", show_diagnostics)!!;
+            particle_count = imgui::slider_int("Preview particles", particle_count, 1, 1000)!!;
+            workspace = imgui::input_text("Workspace", workspace, 128)!!;
+            const rebuild = imgui::button("Rebuild preview")!!;
+            if rebuild {
+                rebuild_count += 1;
+            }
+            imgui::text($"Preview rebuilt {rebuild_count} times")!!;
+            if show_diagnostics {
+                imgui::text($"Mouse captured: {capture_mouse}")!!;
+                imgui::text($"Keyboard captured: {capture_keyboard}")!!;
+            }
+        }
+        imgui::end_window()!!;
+        capture_mouse = imgui::want_capture_mouse()!!;
+        capture_keyboard = imgui::want_capture_keyboard()!!;
+        imgui::end_frame()!!;
+        sdl::end_frame()!!;
+    }
+
+    imgui::detach()!!;
+}

@@ -1,0 +1,5 @@
+COGLOCK 1
+root 0
+pkg 0 "cog-sdl-showcase" "0.1.0" path "."
+pkg 1 "cog-sdl" "0.13.0" path "target/.cog-package-cache/6f75be7df2f3fbec943568bfefad4d6cdbc7e7671945c5b6609b75efd50a64cf"
+dep 0 "sdl_lib" 1

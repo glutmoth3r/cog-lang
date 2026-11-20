@@ -1,0 +1,5 @@
+COGLOCK 1
+root 0
+pkg 0 "cog-raylib-showcase" "0.1.0" path "."
+pkg 1 "cog-raylib" "0.1.18" path "target/.cog-package-cache/402b7f450395dfea581327bd9aabd4d8dcd79a8868f627ee78daa91c88b3c6d2"
+dep 0 "raylib_lib" 1

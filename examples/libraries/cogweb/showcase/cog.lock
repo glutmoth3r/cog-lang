@@ -1,0 +1,5 @@
+COGLOCK 1
+root 0
+pkg 0 "cogweb-showcase" "0.1.0" path "."
+pkg 1 "cogweb" "0.3.0" path "target/.cog-package-cache/c08d5cd54246556de0da1a09ec9d8d64cbabdfb5e952826afbada620f0de9a26"
+dep 0 "cogweb" 1

@@ -1,0 +1,110 @@
+@!include("std")
+@!include("raylib_lib")
+
+use raylib from raylib_lib;
+use ray;
+
+fn main() -> nil {
+    ray::open(960, 640, "Cog raylib showcase")!!;
+    ray::set_window_resizable(true)!!;
+    ray::set_target_fps(60)!!;
+
+    var x_milli = 450000;
+    var y_milli = 300000;
+    var radius = 42;
+    var paused = false;
+    var use_accent = false;
+
+    while !ray::window_should_close() {
+        if ray::key_pressed(raylib::KEY_SPACE) {
+            paused = !paused;
+        }
+        if ray::key_pressed(raylib::KEY_R) {
+            x_milli = 450000;
+            y_milli = 300000;
+            radius = 42;
+            paused = false;
+        }
+        if ray::key_pressed(raylib::KEY_Q) {
+            use_accent = !use_accent;
+        }
+        if ray::mouse_button_pressed(raylib::MOUSE_BUTTON_LEFT) {
+            x_milli = ray::mouse_x() * 1000;
+            y_milli = ray::mouse_y() * 1000;
+        }
+
+        const wheel = ray::mouse_wheel();
+        radius += wheel * 4;
+        if radius < 12 { radius = 12; }
+        if radius > 120 { radius = 120; }
+
+        var frame_ms = ray::frame_time_ms();
+        if frame_ms > 50 { frame_ms = 50; }
+        if !paused {
+            const step = frame_ms * 220;
+            if ray::key_down(raylib::KEY_LEFT) || ray::key_down(raylib::KEY_A) {
+                x_milli -= step;
+            }
+            if ray::key_down(raylib::KEY_RIGHT) || ray::key_down(raylib::KEY_D) {
+                x_milli += step;
+            }
+            if ray::key_down(raylib::KEY_UP) || ray::key_down(raylib::KEY_W) {
+                y_milli -= step;
+            }
+            if ray::key_down(raylib::KEY_DOWN) || ray::key_down(raylib::KEY_S) {
+                y_milli += step;
+            }
+        }
+
+        const width = ray::screen_width();
+        const height = ray::screen_height();
+        var max_x = (width - radius) * 1000;
+        var max_y = (height - radius) * 1000;
+        if max_x < radius * 1000 { max_x = radius * 1000; }
+        if max_y < radius * 1000 { max_y = radius * 1000; }
+        if x_milli < radius * 1000 { x_milli = radius * 1000; }
+        if y_milli < radius * 1000 { y_milli = radius * 1000; }
+        if x_milli > max_x { x_milli = max_x; }
+        if y_milli > max_y { y_milli = max_y; }
+
+        const x = x_milli / 1000;
+        const y = y_milli / 1000;
+        var red = 87;
+        var green = 207;
+        var blue = 180;
+        if use_accent {
+            red = 250;
+            green = 166;
+            blue = 82;
+        }
+        var motion = "running";
+        if paused { motion = "paused"; }
+
+        ray::begin_drawing()!!;
+        ray::clear(17, 24, 39, 255)!!;
+        for column in 0..(width / 48 + 1) {
+            const grid_x = column * 48;
+            ray::draw_line(grid_x, 64, grid_x, height, 40, 52, 72, 255)!!;
+        }
+        for row in 0..(height / 48 + 1) {
+            const grid_y = 64 + row * 48;
+            ray::draw_line(0, grid_y, width, grid_y, 40, 52, 72, 255)!!;
+        }
+        ray::draw_rectangle(0, 0, width, 64, 24, 33, 51, 255)!!;
+        ray::draw_circle(x, y, radius, red, green, blue, 255)!!;
+        ray::draw_circle(x, y, radius + 12, red, green, blue, 90)!!;
+        ray::draw_line(x - radius - 20, y, x + radius + 20, y, red, green, blue, 180)!!;
+        ray::draw_line(x, y - radius - 20, x, y + radius + 20, red, green, blue, 180)!!;
+        ray::draw_text(
+            "RAYLIB FIELD LAB  |  WASD/arrows move  |  click jumps  |  wheel scales",
+            20, 18, 18, 232, 239, 249, 255
+        )!!;
+        ray::draw_text(
+            $"radius {radius}px  |  {motion}  |  Q changes palette  |  R resets",
+            20, 42, 14, 149, 163, 184, 255
+        )!!;
+        ray::end_drawing()!!;
+    }
+
+    ray::close()!!;
+}

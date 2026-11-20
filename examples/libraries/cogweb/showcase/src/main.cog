@@ -1,0 +1,95 @@
+@!include("std")
+@!include("cogweb")
+
+use async::net;
+use err::Error;
+use http;
+use io;
+use router;
+use security;
+
+@comptime const PORT = 4174;
+@comptime const MAX_REQUEST_BYTES = 32 * 1024;
+
+fn build_router() -> router::Router {
+    var routes = router::Router::new();
+    routes.get("/", "home");
+    routes.get("/api/status", "status");
+    routes.get("/api/hello/:name", "hello");
+    routes.get("/api/path/:root/*tail", "path");
+    routes
+}
+
+@async fn send_response(socket, response: http::Response) -> nil {
+    const secured = security::apply_defaults(response)!!;
+    await http::write_response(socket, secured)!!;
+}
+
+@async fn handle_connection(socket, routes: router::Router) -> nil {
+    defer { io::close(socket)!!; }
+    const incoming = await http::read_request(socket, MAX_REQUEST_BYTES);
+    when incoming is Error::ResourceLimit {
+        await send_response(socket, http::json_response(413, {
+            error: "Request is too large",
+        }))!!;
+    } else {
+        when incoming is Error::ParseFailure {
+            await send_response(socket, http::json_response(400, {
+                error: "Invalid HTTP request",
+            }))!!;
+        } else {
+            when incoming is Error {
+                incoming!!;
+            } else {
+                const request = incoming;
+                const matched = routes.resolve_match(request.method, request.path);
+                var response = http::json_response(404, { error: "Not found" });
+                if matched != nil {
+                    const route_id = matched.id;
+                    if route_id == "home" {
+                        response = http::html_page_response(
+                            200,
+                            "Cog web showcase",
+                            "<h1>Cog web showcase</h1><p>Try <a href='/api/status'>/api/status</a>, <a href='/api/hello/Cog'>/api/hello/Cog</a>, or <code>/api/path/examples/libraries</code>.</p>"
+                        );
+                    } else if route_id == "status" {
+                        response = http::json_response(200, {
+                            service: "cogweb showcase",
+                            ready: true,
+                            port: PORT,
+                        });
+                    } else if route_id == "hello" {
+                        const name = matched.param("name") ?? "world";
+                        const safe_name = http::html_escape(name)!!;
+                        response = http::html_page_response(
+                            200,
+                            "Hello",
+                            $"<h1>Hello, {safe_name}!</h1><p>Route parameters are decoded and escaped before rendering.</p>"
+                        );
+                    } else if route_id == "path" {
+                        response = http::json_response(200, {
+                            root: matched.param("root") ?? "",
+                            tail: matched.param("tail") ?? "",
+                        });
+                    }
+                }
+                const secured = security::apply_defaults(response)!!;
+                await http::write_response_for(socket, request, secured)!!;
+            }
+        }
+    }
+}
+
+@async fn main() -> nil {
+    const routes = build_router()!!;
+    const listener = await net::listen("127.0.0.1", PORT)!!;
+    io::println($"Cog web showcase: http://127.0.0.1:{PORT}/")!!;
+    while true {
+        const accepted = await net::accept(listener, 300000, 10000);
+        when accepted is Error::Timeout {
+            // Keep waiting for the next local request.
+        } else {
+            await handle_connection(accepted!!, routes)!!;
+        }
+    }
+}
