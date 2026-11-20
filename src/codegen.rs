@@ -1065,7 +1065,7 @@ fn compile_with_modules_and_names(
                 "no entry point: expected a function named `main`",
             ));
         };
-        if !main.params.is_empty() && !is_main_arguments_parameter(&main.params) {
+        if !main.params.is_empty() && !is_main_arguments_parameter(main.params) {
             return Err(CodegenError::new(
                 "`main` must take no parameters or exactly `args: str[]`",
             ));
@@ -2931,13 +2931,7 @@ impl<'a> Codegen<'a> {
                 CodegenError::new(format!("unknown extension method `{method}()`"))
             })?;
             return self.compile_declared_method_call(
-                name,
-                &sig.params,
-                receiver,
-                args,
-                sig.module,
-                call_site,
-                scopes,
+                name, sig.params, receiver, args, sig.module, call_site, scopes,
             );
         }
         // The receiver is evaluated first. Conversions share the native ABI
@@ -3391,7 +3385,7 @@ impl<'a> Codegen<'a> {
             for binding in &function.bindings {
                 self.compile_stmt(binding, scopes, &mut deferred)?;
             }
-            self.compile_expr(&function.body, scopes)
+            self.compile_expr(function.body, scopes)
         })();
         self.cleanup_boundary = saved_cleanup_boundary;
         self.error_handler = saved_error_handler;
@@ -3582,7 +3576,7 @@ impl<'a> Codegen<'a> {
             parameter_names.push(name.clone());
             values.push(Self::constant_value_expression(&value)?);
         }
-        let expression = substitute_constant_parameters(&function.body, &parameter_names, &values)?;
+        let expression = substitute_constant_parameters(function.body, &parameter_names, &values)?;
         crate::comptime::fold_constant_expression(&expression)
     }
 
@@ -4080,7 +4074,7 @@ impl<'a> Codegen<'a> {
                 if let Some(fields) = self.struct_defs.get(&resolved).cloned() {
                     self.compile_declared_call(
                         &resolved,
-                        &fields,
+                        fields,
                         args,
                         module,
                         DeclaredCall::Record,
@@ -4100,7 +4094,7 @@ impl<'a> Codegen<'a> {
                 } else if let Some(sig) = self.functions.get(&resolved).cloned() {
                     self.compile_declared_call(
                         &resolved,
-                        &sig.params,
+                        sig.params,
                         args,
                         sig.module,
                         DeclaredCall::Function,
@@ -4130,7 +4124,7 @@ impl<'a> Codegen<'a> {
                 };
                 self.compile_declared_call(
                     &resolved,
-                    &sig.params,
+                    sig.params,
                     args,
                     sig.module,
                     DeclaredCall::Function,

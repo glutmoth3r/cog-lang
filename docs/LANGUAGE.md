@@ -305,7 +305,9 @@ mean optional:** `value: int?` still requires an argument; `value: int? = nil` d
 Explicit arguments evaluate once in written order, then omitted defaults evaluate
 in declaration order in the declaration's environment. Defaults do not capture
 caller locals. Struct and enum payload constructors use these same rules. Native
-functions and existing receiver methods accept positional arguments only.
+functions and existing receiver methods accept positional arguments only. Extension
+method calls may omit trailing parameters with defaults, evaluated after the receiver
+and explicit arguments.
 
 The last expression of a block without `;` is its result. A block without a tail
 has normal result nil. This is shared by functions, if/when/match, and try/catch.
@@ -637,6 +639,8 @@ The compiler resolves these trait methods statically. Arrays, strings, and
 dynamic values keep their existing runtime iteration paths. User-defined
 iteration requires a statically known concrete collection type; a generic
 function cannot currently iterate a parameter through an `IntoIterator` bound.
+The effects of iterator methods and the capabilities of returned items participate
+in mutability analysis, including for zipped loops.
 When JIT is enabled, custom iterator calls may resume in the VM; native execution
 of these methods is not guaranteed.
 

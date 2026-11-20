@@ -194,6 +194,27 @@ fn deferred_async_method_mutation_cannot_reach_a_later_const_alias() {
 }
 
 #[test]
+fn deferred_async_method_default_cannot_reach_a_later_const_alias() {
+    rejects_semantically(
+        r#"
+        var holder = {item: [1]};
+        struct Worker { value: int }
+        extend Worker {
+            @async fn change(self, target = holder) -> nil { target.item[0] = 99; }
+        }
+        @async fn main() {
+            const protected = [10];
+            const worker = Worker(1);
+            const pending = worker.change();
+            holder.item = protected;
+            await pending;
+        }
+        "#,
+        &["read-only"],
+    );
+}
+
+#[test]
 fn mutable_capture_cannot_upgrade_const_aliases_before_or_after_a_call() {
     for body in [
         r#"

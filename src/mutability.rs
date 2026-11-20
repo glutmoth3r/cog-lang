@@ -41,6 +41,7 @@ pub(crate) struct Facts {
     pub symbol_names: HashMap<String, String>,
     pub invalid_bindings: BTreeSet<usize>,
     pub fallback_possible: HashMap<usize, bool>,
+    pub iterations: HashMap<usize, Vec<Option<crate::analysis::IterationMethods>>>,
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -242,6 +243,18 @@ struct Loop<'a> {
     cleanup: usize,
     breaks: Vec<State<'a>>,
     continues: Vec<State<'a>>,
+}
+enum Iteration<'a> {
+    Custom {
+        iterable: &'a Expr,
+        pattern: &'a BindingPattern,
+        methods: crate::analysis::IterationMethods,
+        iterator: Access,
+    },
+    Sequence {
+        pattern: &'a BindingPattern,
+        collection: Access,
+    },
 }
 struct Pass<'a> {
     facts: &'a Facts,
@@ -967,7 +980,7 @@ impl<'a> Pass<'a> {
                 );
             }
             Stmt::While { cond, body } => {
-                self.loop_body(Some(cond), body, None);
+                self.loop_body(Some(cond), body, None, &[]);
             }
             Stmt::For {
                 var,
@@ -983,7 +996,7 @@ impl<'a> Pass<'a> {
                 }
                 self.state.scopes.push(HashMap::new());
                 self.define(var, stmt_id(stmt), true, Access::default());
-                self.loop_body(None, body, range_empty(start, end, step.as_deref()));
+                self.loop_body(None, body, range_empty(start, end, step.as_deref()), &[]);
                 self.state.scopes.pop();
             }
             Stmt::ForEach {
@@ -992,16 +1005,43 @@ impl<'a> Pass<'a> {
                 body,
             } => {
                 let collection = self.expr(iterable);
-                let item = self.project(&collection, &Key::AnyIndex);
+                let methods = self
+                    .facts
+                    .iterations
+                    .get(&stmt_id(stmt))
+                    .and_then(|methods| methods.first())
+                    .cloned()
+                    .flatten();
+                let iteration = if let Some(methods) = methods {
+                    let iterator = self.iteration_call(
+                        iterable,
+                        &methods.into_iter,
+                        &methods.into_iter_template,
+                        &collection,
+                    );
+                    Iteration::Custom {
+                        iterable,
+                        pattern,
+                        methods,
+                        iterator,
+                    }
+                } else {
+                    Iteration::Sequence {
+                        pattern,
+                        collection,
+                    }
+                };
                 self.state.scopes.push(HashMap::new());
-                self.define_pattern(pattern, item, true);
-                self.loop_body(None, body, None);
+                self.define_pattern(pattern, Access::default(), true);
+                self.loop_body(None, body, None, &[iteration]);
                 self.state.scopes.pop();
             }
             Stmt::ForZip { clauses, body } => {
                 let mut empty = Some(false);
                 let mut bindings = Vec::with_capacity(clauses.len());
-                for clause in clauses {
+                let mut iterations = Vec::new();
+                let methods = self.facts.iterations.get(&stmt_id(stmt)).cloned();
+                for (index, clause) in clauses.iter().enumerate() {
                     match clause {
                         ForClause::Range {
                             start, end, step, ..
@@ -1018,12 +1058,38 @@ impl<'a> Pass<'a> {
                             };
                             bindings.push((clause, Access::default()));
                         }
-                        ForClause::Each { iterable, .. } => {
+                        ForClause::Each { pattern, iterable } => {
                             let collection = self.expr(iterable);
                             if empty != Some(true) {
                                 empty = None;
                             }
-                            bindings.push((clause, self.project(&collection, &Key::AnyIndex)));
+                            let methods = methods
+                                .as_ref()
+                                .and_then(|methods| methods.get(index))
+                                .cloned()
+                                .flatten();
+                            if let Some(methods) = methods {
+                                let iterator = self.iteration_call(
+                                    iterable,
+                                    &methods.into_iter,
+                                    &methods.into_iter_template,
+                                    &collection,
+                                );
+                                if empty != Some(true) {
+                                    iterations.push(Iteration::Custom {
+                                        iterable,
+                                        pattern,
+                                        methods,
+                                        iterator,
+                                    });
+                                }
+                            } else if empty != Some(true) {
+                                iterations.push(Iteration::Sequence {
+                                    pattern,
+                                    collection,
+                                });
+                            }
+                            bindings.push((clause, Access::default()));
                         }
                     }
                 }
@@ -1038,7 +1104,7 @@ impl<'a> Pass<'a> {
                         }
                     }
                 }
-                self.loop_body(None, body, empty);
+                self.loop_body(None, body, empty, &iterations);
                 self.state.scopes.pop();
             }
             Stmt::Break => {
@@ -1155,7 +1221,40 @@ impl<'a> Pass<'a> {
         }
         value
     }
-    fn loop_body(&mut self, cond: Option<&'a Expr>, body: &'a Block, empty: Option<bool>) {
+    fn iteration_call(
+        &mut self,
+        site: &'a Expr,
+        name: &str,
+        template: &str,
+        receiver: &Access,
+    ) -> Access {
+        let name = if self.summaries.contains_key(name) {
+            name
+        } else {
+            template
+        };
+        let result = if let Some(summary) = self.summaries.get(name).cloned() {
+            self.apply_call_summary(site, name, summary, std::slice::from_ref(receiver))
+        } else {
+            if self.emit {
+                self.diagnostics.push(Diagnostic::new(
+                    "E2001",
+                    format!("cannot analyze effects of iterator method `{name}`"),
+                    site.span().cloned().or_else(|| self.location.clone()),
+                ));
+            }
+            receiver.readonly("unresolved iterator result")
+        };
+        self.observe();
+        result
+    }
+    fn loop_body(
+        &mut self,
+        cond: Option<&'a Expr>,
+        body: &'a Block,
+        empty: Option<bool>,
+        iterations: &[Iteration<'a>],
+    ) {
         let initial = self.state.clone();
         let dead = empty == Some(true) || cond.and_then(bool_literal) == Some(false);
         self.loops.push(Loop {
@@ -1168,6 +1267,38 @@ impl<'a> Pass<'a> {
             if let Some(c) = cond {
                 self.expr(c);
             }
+            for iteration in iterations {
+                match iteration {
+                    Iteration::Custom {
+                        iterable,
+                        pattern,
+                        methods,
+                        iterator,
+                    } => {
+                        self.iteration_call(
+                            iterable,
+                            &methods.next,
+                            &methods.next_template,
+                            iterator,
+                        );
+                        let item = self.iteration_call(
+                            iterable,
+                            &methods.current,
+                            &methods.current_template,
+                            iterator,
+                        );
+                        self.define_pattern(pattern, item, true);
+                    }
+                    Iteration::Sequence {
+                        pattern,
+                        collection,
+                    } => {
+                        let item = self.project(collection, &Key::AnyIndex);
+                        self.define_pattern(pattern, item, true);
+                    }
+                }
+            }
+            let condition_state = self.state.clone();
             let condition_returns = self.state.alive;
             self.state.alive &= !dead;
             self.block(body);
@@ -1185,6 +1316,9 @@ impl<'a> Pass<'a> {
                 break;
             }
             self.state = before.clone();
+            if condition_state.alive {
+                self.state.join(&condition_state);
+            }
             if after.alive {
                 self.state.join(&after);
             }
@@ -1517,6 +1651,16 @@ impl<'a> Pass<'a> {
                     call_arguments.push(value);
                     call_arguments.extend(arguments);
                     let name = name.clone();
+                    if let Some(fields) = self.functions.get(&name).map(|f| f.params.as_slice()) {
+                        for field in fields.iter().skip(call_arguments.len()) {
+                            if let Some(default) = &field.default {
+                                let scopes =
+                                    std::mem::replace(&mut self.state.scopes, vec![HashMap::new()]);
+                                call_arguments.push(self.expr(default));
+                                self.state.scopes = scopes;
+                            }
+                        }
+                    }
                     return self.apply_call_summary(expr, &name, summary, &call_arguments);
                 }
                 if mutating_call {

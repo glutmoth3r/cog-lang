@@ -144,6 +144,263 @@ fn local_constants_and_default_arguments_are_checked_in_declaration_context() {
 }
 
 #[test]
+fn method_default_arguments_preserve_mutation_and_return_capabilities() {
+    rejects(
+        "const DEFAULT = [1]; struct Box { value: int } extend Box { fn change(self, values: int[] = DEFAULT) { values << 2; } } fn main() { const box = Box(1); box.change(); }",
+        "cannot mutate",
+    );
+    rejects(
+        "const DEFAULT = [1]; struct Box { value: int } extend Box { fn identity(self, values: int[] = DEFAULT) -> int[] { values } } fn main() { const box = Box(1); box.identity() << 2; }",
+        "cannot mutate",
+    );
+    rejects(
+        "const DEFAULT = [1]; fn change(values: int[]) -> int[] { values << 2; values } struct Box { value: int } extend Box { fn consume(self, values: int[] = change(DEFAULT)) {} } fn main() { const box = Box(1); box.consume(); }",
+        "cannot mutate",
+    );
+    rejects(
+        "const DEFAULT = [1]; struct Box[T: type] { value: T } extend[T: type] Box[T] { fn change(self, values: int[] = DEFAULT) { values << 2; } } fn main() { const box = Box(1); box.change(); }",
+        "cannot mutate",
+    );
+    rejects(
+        "const DEFAULT = [1]; struct Box { value: int } extend Box { @async fn change(self, values: int[] = DEFAULT) { values << 2; } } @async fn main() { const box = Box(1); await box.change(); }",
+        "cannot mutate",
+    );
+    assert_eq!(
+        run(
+            "struct Box { value: int } extend Box { fn change(self, values: int[] = [1]) -> int[] { values << 2; values } } fn main() { const box = Box(1); io::println(box.change()); }"
+        ),
+        "[1, 2]\n"
+    );
+}
+
+#[test]
+fn custom_iterator_items_preserve_capabilities_in_single_and_zip_loops() {
+    let declarations = r#"
+        use iter;
+        const protected = [10];
+        struct Source { values: int[] }
+        struct Cursor { values: int[], position: int }
+        extend Source with iter::IntoIterator[Cursor, int[]] {
+            fn into_iter(self) -> Cursor { Cursor(self.values, 0) }
+        }
+        extend Cursor with iter::Iterator[int[]] {
+            fn next(mut self) -> bool {
+                if self.position > 0 { return false; }
+                self.position += 1;
+                true
+            }
+            fn current(self) -> int[] { self.values }
+        }
+    "#;
+    for loop_body in [
+        "for value in Source(protected) { value << 99; }",
+        "for index in 0..1, value in Source(protected) { value << index; }",
+    ] {
+        rejects(
+            &format!("{declarations} fn main() {{ {loop_body} }}"),
+            "cannot mutate",
+        );
+    }
+    assert_eq!(
+        run(&format!(
+            "{declarations} fn main() {{ for value in Source([10]) {{ value << 99; io::println(value); }} }}"
+        )),
+        "[10, 99]\n"
+    );
+}
+
+#[test]
+fn custom_iterator_protocol_effects_are_checked_before_loop_body() {
+    let declarations = r#"
+        use iter;
+        const protected = [10];
+        struct Source { values: int[] }
+        struct Cursor { values: int[], position: int }
+        extend Source with iter::IntoIterator[Cursor, int[]] {
+            fn into_iter(self) -> Cursor { Cursor(self.values, 0) }
+        }
+        extend Cursor with iter::Iterator[int[]] {
+            fn next(mut self) -> bool {
+                if self.position > 0 { return false; }
+                self.position += 1;
+                self.values = protected;
+                true
+            }
+            fn current(self) -> int[] { self.values }
+        }
+    "#;
+    rejects(
+        &format!("{declarations} fn main() {{ for value in Source([1]) {{ value << 99; }} }}"),
+        "cannot mutate",
+    );
+    rejects(
+        &format!(
+            "{declarations} fn main() {{ for index in 0..1, value in Source([1]) {{ value << index; }} }}"
+        ),
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn custom_iterator_current_cannot_launder_a_global_const() {
+    rejects(
+        r#"
+        use iter;
+        const protected = [10];
+        struct Source { value: int }
+        struct Cursor { position: int }
+        extend Source with iter::IntoIterator[Cursor, int[]] {
+            fn into_iter(self) -> Cursor { Cursor(self.value) }
+        }
+        extend Cursor with iter::Iterator[int[]] {
+            fn next(mut self) -> bool {
+                if self.position > 0 { return false; }
+                self.position += 1;
+                true
+            }
+            fn current(self) -> int[] { protected }
+        }
+        fn main() { for value in Source(0) { value << 99; } }
+        "#,
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn custom_iterator_protocol_mutations_respect_captured_capabilities() {
+    for (into_iter, next, current) in [
+        ("self.values << 2;", "", ""),
+        ("", "self.values << 2;", ""),
+        ("", "", "self.values << 2;"),
+    ] {
+        let program = format!(
+            r#"
+            use iter;
+            const protected = [10];
+            struct Source {{ values: int[] }}
+            struct Cursor {{ values: int[], position: int }}
+            extend Source with iter::IntoIterator[Cursor, int] {{
+                fn into_iter(self) -> Cursor {{ {into_iter} Cursor(self.values, 0) }}
+            }}
+            extend Cursor with iter::Iterator[int] {{
+                fn next(mut self) -> bool {{
+                    {next}
+                    if self.position > 0 {{ return false; }}
+                    self.position += 1;
+                    true
+                }}
+                fn current(self) -> int {{ {current} self.position }}
+            }}
+            fn main() {{ for value in Source(protected) {{ value; }} }}
+            "#
+        );
+        rejects(&program, "cannot mutate");
+    }
+}
+
+#[test]
+fn generic_iterator_specialization_retains_item_capabilities() {
+    let declarations = r#"
+        use iter;
+        const protected = [10];
+        struct Source[T: type] { value: T }
+        struct Cursor[T: type] { value: T, position: int }
+        extend[T: type] Source[T] with iter::IntoIterator[Cursor[T], T] {
+            fn into_iter(self) -> Cursor[T] { Cursor(self.value, 0) }
+        }
+        extend[T: type] Cursor[T] with iter::Iterator[T] {
+            fn next(mut self) -> bool {
+                if self.position > 0 { return false; }
+                self.position += 1;
+                true
+            }
+            fn current(self) -> T { self.value }
+        }
+    "#;
+    rejects(
+        &format!(
+            "{declarations} fn main() {{ for value in Source(protected) {{ value << 99; }} }}"
+        ),
+        "cannot mutate",
+    );
+    assert_eq!(
+        run(&format!(
+            "{declarations} fn main() {{ for value in Source([10]) {{ value << 99; io::println(value); }} }}"
+        )),
+        "[10, 99]\n"
+    );
+}
+
+#[test]
+fn iterator_effects_remain_visible_after_break() {
+    rejects(
+        r#"
+        use iter;
+        var shared = [1];
+        const protected = [10];
+        struct Source { value: int }
+        struct Cursor { position: int }
+        extend Source with iter::IntoIterator[Cursor, int] {
+            fn into_iter(self) -> Cursor { Cursor(self.value) }
+        }
+        extend Cursor with iter::Iterator[int] {
+            fn next(mut self) -> bool { self.position += 1; true }
+            fn current(self) -> int { shared = protected; self.position }
+        }
+        fn main() { for value in Source(0) { break; } shared << 99; }
+        "#,
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn zip_skips_iterator_steps_after_a_known_empty_range() {
+    let declarations = r#"
+        use iter;
+        const protected = [10];
+        struct Source { values: int[] }
+        struct Cursor { values: int[] }
+        extend Source with iter::IntoIterator[Cursor, int] {
+            fn into_iter(self) -> Cursor { Cursor(self.values) }
+        }
+        extend Cursor with iter::Iterator[int] {
+            fn next(mut self) -> bool { self.values << 99; self.values = [1]; false }
+            fn current(self) -> int { 0 }
+        }
+    "#;
+    run(&format!(
+        "{declarations} fn main() {{ for index in 0..0, value in Source(protected) {{ index; value; }} }}"
+    ));
+    rejects(
+        &format!(
+            "{declarations} fn main() {{ for value in Source(protected), index in 0..0 {{ value; index; }} }}"
+        ),
+        "cannot mutate",
+    );
+}
+
+#[test]
+fn iteration_rechecks_elements_after_the_collection_changes() {
+    for loop_body in [
+        "for value in arrays { value << 99; arrays[1] = protected; }",
+        "for index in 0..2, value in arrays { value << index; arrays[1] = protected; }",
+    ] {
+        rejects(
+            &format!(
+                "fn main() {{ const protected = [10]; var arrays = [[1], [2]]; {loop_body} }}"
+            ),
+            "cannot mutate",
+        );
+    }
+    assert_eq!(
+        run(
+            "fn main() { var arrays = [[1], [2]]; for value in arrays { value << 3; } io::println(arrays); }"
+        ),
+        "[[1, 3], [2, 3]]\n"
+    );
+}
+
+#[test]
 fn native_heap_mutations_are_distinct_from_resource_operations() {
     rejects(
         "use bytes; fn main() { const b = bytes::new(1); bytes::set(b, 0, 65); }",

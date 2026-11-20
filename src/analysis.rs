@@ -1334,6 +1334,9 @@ pub(crate) struct IterationMethods {
     pub into_iter: String,
     pub next: String,
     pub current: String,
+    pub into_iter_template: String,
+    pub next_template: String,
+    pub current_template: String,
 }
 
 pub(crate) fn expression_site(function: Option<&str>, expr: &Expr) -> CallSite {
@@ -1838,7 +1841,7 @@ impl<'a> Checker<'a> {
         receiver_type: &Type,
         method: &str,
         span: Option<SourceSpan>,
-    ) -> Option<(Type, String)> {
+    ) -> Option<(Type, String, String)> {
         let binding_name = format!("$iteration_receiver_{}", self.next_binding);
         let binding_id = self.next_binding;
         self.next_binding += 1;
@@ -1869,11 +1872,18 @@ impl<'a> Checker<'a> {
             .get(&site)
             .or_else(|| self.method_calls.get(&site))
             .cloned();
+        let template = self
+            .access_facts
+            .calls
+            .remove(&crate::mutability::expr_id(&call));
+        self.access_facts
+            .specializations
+            .remove(&crate::mutability::expr_id(&call));
         self.scopes.pop();
 
         resolved
             .filter(|_| result != Type::Poison)
-            .map(|name| (result, name))
+            .map(|name| (result, template.unwrap_or_else(|| name.clone()), name))
     }
 
     fn custom_iteration(
@@ -1952,7 +1962,7 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let (actual_iterator_type, into_iter) =
+        let (actual_iterator_type, into_iter_template, into_iter) =
             self.check_iteration_method(collection, "into_iter", span.clone())?;
         if !type_compatible(iterator_type, &actual_iterator_type) {
             self.error(
@@ -1967,7 +1977,8 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let (next_type, next) = self.check_iteration_method(iterator_type, "next", span.clone())?;
+        let (next_type, next_template, next) =
+            self.check_iteration_method(iterator_type, "next", span.clone())?;
         if !type_compatible(&Type::concrete(VarType::Bool), &next_type) {
             self.error(
                 "E2001",
@@ -1977,7 +1988,7 @@ impl<'a> Checker<'a> {
             return None;
         }
 
-        let (current_type, current) =
+        let (current_type, current_template, current) =
             self.check_iteration_method(iterator_type, "current", span.clone())?;
         if !type_compatible(item_type, &current_type) {
             self.error(
@@ -1998,6 +2009,9 @@ impl<'a> Checker<'a> {
                 into_iter,
                 next,
                 current,
+                into_iter_template,
+                next_template,
+                current_template,
             },
         ))
     }
@@ -4453,8 +4467,11 @@ impl<'a> Checker<'a> {
                 };
                 self.iteration_calls.insert(
                     statement_site(self.current_function.as_deref(), stmt),
-                    vec![iteration],
+                    vec![iteration.clone()],
                 );
+                self.access_facts
+                    .iterations
+                    .insert(stmt.node() as *const Stmt as usize, vec![iteration]);
                 let mut bindings = Vec::new();
                 self.collect_binding_types(pattern, element, iterable.span(), &mut bindings);
                 self.scopes.push(Scope::default());
@@ -4538,8 +4555,11 @@ impl<'a> Checker<'a> {
                 }
                 self.iteration_calls.insert(
                     statement_site(self.current_function.as_deref(), stmt),
-                    iteration_methods,
+                    iteration_methods.clone(),
                 );
+                self.access_facts
+                    .iterations
+                    .insert(stmt.node() as *const Stmt as usize, iteration_methods);
                 self.scopes.push(Scope::default());
                 for (name, ty, span) in bindings {
                     self.define(
@@ -5970,7 +5990,18 @@ impl<'a> Checker<'a> {
                         );
                     }
                     let expected = function.params.len().saturating_sub(1);
-                    if args.len() != expected {
+                    let required = function
+                        .params
+                        .iter()
+                        .skip(1)
+                        .filter(|param| param.default.is_none())
+                        .count();
+                    if args.len() < required || args.len() > expected {
+                        let expected = if required == expected {
+                            expected.to_string()
+                        } else {
+                            format!("{required} to {expected}")
+                        };
                         self.error(
                             "E1005",
                             format!(

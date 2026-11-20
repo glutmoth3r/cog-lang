@@ -66,6 +66,103 @@ fn default_closures_and_methods_keep_their_checked_declaration_context() {
 }
 
 #[test]
+fn method_defaults_follow_receiver_and_arguments_in_declaration_order() {
+    assert_eq!(
+        run(r#"
+        var trace = 0;
+        fn mark(value: int) -> int { trace = trace * 10 + value; value }
+        struct Box { value: int }
+        extend Box {
+            fn combine(self, first: int, second: int = mark(3), third: int = mark(4)) -> int {
+                self.value + first + second + third
+            }
+            fn apply(self, callback: fn(int) -> int = fn[](value: int) -> int { value + 1 }) -> int {
+                (callback)(self.value)
+            }
+        }
+        fn receiver() -> Box { mark(1); Box(10) }
+        fn main() {
+            io::println(receiver().combine(mark(2)));
+            io::println(trace);
+            io::println(Box(41).apply());
+            io::println(Box(41).apply());
+        }
+        "#),
+        "19\n1234\n42\n42\n"
+    );
+}
+
+#[test]
+fn generic_and_async_methods_evaluate_defaults_at_the_call_site() {
+    assert_eq!(
+        run(r#"
+        var trace = 0;
+        fn mark(value: int) -> int { trace = trace * 10 + value; value }
+        struct Box[T: type] { value: T }
+        extend[T: type] Box[T] {
+            fn value_or(self, number: int = mark(1)) -> int { number }
+            @async fn later(self, number: int = mark(2)) -> int { number }
+        }
+        @async fn main() {
+            const box = Box(42);
+            io::println(box.value_or());
+            const task = box.later();
+            io::println(trace);
+            io::println(await task);
+        }
+        "#),
+        "1\n12\n2\n"
+    );
+}
+
+#[test]
+fn method_arity_checks_required_and_defaulted_parameters() {
+    for (call, expected) in [
+        ("item.combine()", "got 0"),
+        ("item.combine(1, 2, 3)", "got 3"),
+    ] {
+        let source = format!(
+            "struct Item {{ value: int }} extend Item {{ fn combine(self, first: int, second: int = 0) {{}} }} fn main() {{ const item = Item(1); {call}; }}"
+        );
+        let error = project::compile_source("method_arity.cog", &source)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("E1005") && error.contains(expected),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn failing_method_defaults_preserve_cleanup_and_caller_stack() {
+    assert_eq!(
+        run(r#"
+        var trace = 0;
+        fn mark(value: int) -> int { trace = trace * 10 + value; value }
+        struct Box { value: int }
+        extend Box {
+            fn combine(self, first: int, second: int = mark(2), third: int = 1 / 0) -> int {
+                self.value + first + second + third
+            }
+            fn okay(self, value: int = 2) -> int { self.value + value }
+        }
+        fn work() -> int {
+            defer { trace = trace * 10 + 7; }
+            Box(mark(1)).combine(mark(3))
+        }
+        fn main() {
+            try { 200 + work(); }
+            catch(error) { when error is Error::DivisionByZero {} else { crash(error); } }
+            require(trace == 1327);
+            io::println(300 + Box(4).okay());
+        }
+        "#),
+        "306\n"
+    );
+}
+
+#[test]
 fn trailing_commas_work_in_all_existing_delimited_lists() {
     assert_eq!(
         run(r#"

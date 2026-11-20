@@ -738,6 +738,34 @@ fn jit_conditional_jumps_match_vm_for_true_and_false_paths() {
 }
 
 #[test]
+fn jit_method_defaults_preserve_evaluation_order() {
+    assert_jit_fallback_matches_vm(
+        r#"
+        @!include("std") use io;
+        var trace = 0;
+        fn mark(value: int) -> int { trace += value; value }
+        struct Counter { value: int }
+        extend Counter {
+            fn add(self, amount: int = mark(1)) -> int { self.value + amount }
+        }
+        fn main() {
+            const counter = Counter(1);
+            var index = 0;
+            var sum = 0;
+            while index < 6000 {
+                sum += counter.add();
+                index += 1;
+            }
+            io::println(sum);
+            io::println(trace);
+        }
+        "#,
+        "method-defaults",
+        "12000\n6000\n",
+    );
+}
+
+#[test]
 fn jit_virtual_operand_stack_matches_vm_for_stack_manipulation_and_truncation() {
     let profile_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")

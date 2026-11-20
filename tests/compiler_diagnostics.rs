@@ -314,14 +314,16 @@ fn unknown_methods_and_invalid_conditions_are_independent_errors() {
 
 #[test]
 fn cli_reports_syntax_and_semantic_errors_together() {
-    let path = std::env::temp_dir().join(format!("cog-errors-{}.cog", std::process::id()));
+    let root = std::env::temp_dir().join(format!("cog-errors-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("main.cog");
     std::fs::write(&path, "fn main() { const a = ; const b: int = false; }").unwrap();
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_cog"))
         .arg("check")
         .arg(&path)
         .output()
         .unwrap();
-    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir_all(&root).unwrap();
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(stderr.contains("E0002"), "{stderr}");
